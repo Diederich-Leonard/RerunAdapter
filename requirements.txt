@@ -1,0 +1,2 @@
+rerun-sdk==0.35.0
+numpy>=2,<3
