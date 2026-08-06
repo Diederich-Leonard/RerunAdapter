@@ -1,29 +1,35 @@
 """Entity paths and the default Rerun view layout.
 
-The entity hierarchy is deliberately the *final* one, even though this iteration logs no
-transforms at all::
+Rerun composes transforms down the entity path, so every sensor is logged in its own native
+frame and the viewer does the placing -- no point cloud or mesh is transformed by hand.
+Because an OKVIS calibration expresses both cameras and lidar relative to the IMU, and a
+trajectory gives the IMU's pose in the world, the IMU frame S is the natural moving root::
 
     /world                        static ViewCoordinates (z up)
-    /world/body                   [later] Transform3D per pose, from a trajectory
-    /world/body/<stream>          [later] static Transform3D (T_SC) + Pinhole
-    /world/body/<stream>/image    EncodedImage per frame, one entity per image stream
-    /world/body/lidar0            static ViewCoordinates; [later] Transform3D (T_SL)
-    /world/body/lidar0/points     Points3D per scan, in raw sensor coordinates
+    /world/axes                   static Arrows3D -- world frame triad
+    /world/trajectory             static LineStrips3D -- the whole estimated path
+    /world/mesh/<name>            static Mesh3D -- vertices already in world coordinates
+    /world/imu                    Transform3D per pose: T_WS, from the trajectory
+    /world/imu/axes               static Arrows3D
+    /world/imu/body               static Transform3D: T_SB, i.e. inverse of the config T_BS
+    /world/imu/<stream>           static Transform3D: T_SC for that camera
+    /world/imu/<stream>/image     static Pinhole + EncodedImage per frame
+    /world/imu/lidar0             static Transform3D: T_SL
+    /world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
     /plots/imu/accel/{x,y,z}      whole series, sent columnar
     /plots/imu/gyro/{x,y,z}       "
 
-With no ``Transform3D`` logged, every frame collapses to identity, so a 3D view whose
-**origin** is ``/world/body/lidar0`` is exactly a lidar-fixed frame -- Rerun renders a
-spatial view relative to its origin and ignores transforms at or above it. That is why
-the same view keeps working untouched once a trajectory arrives and the sensor starts
-moving: points are always stored in raw sensor coordinates, and only the *view* decides
-which frame you look from.
+Two consequences worth spelling out:
 
-Consequently, adding a results overlay later means adding transforms and new sibling
-entities (``/world/trajectory``, ``/world/mesh/...``) plus a second 3D view rooted at
-``/world``. No existing path moves.
+* **Without a trajectory or calibration, nothing changes structurally.** No ``Transform3D``
+  is logged, every frame collapses to identity, and the same paths still work -- which is
+  what lets dataset-only mode and results mode share one hierarchy.
+* **The lidar is logged once and viewable in two frames.** A spatial view renders relative
+  to its origin and ignores transforms at or above it, so a view rooted at
+  ``/world/imu/lidar0`` is lidar-fixed, while one rooted at ``/world`` shows the same points
+  carried into the world by ``T_SL`` then ``T_WS``. No duplicated data.
 
-The IMU plots sit outside ``/world`` so a future world view's default ``$origin/**``
+The IMU scalar plots sit outside ``/world`` so the world view's default ``$origin/**``
 contents never sweeps up non-spatial entities.
 """
 
@@ -38,8 +44,11 @@ import rerun.blueprint as rrb
 TIMELINE = "sensor_time"
 
 WORLD = "/world"
-BODY = f"{WORLD}/body"
-LIDAR = f"{BODY}/lidar0"
+TRAJECTORY = f"{WORLD}/trajectory"
+MESHES = f"{WORLD}/mesh"
+IMU = f"{WORLD}/imu"
+BODY = f"{IMU}/body"
+LIDAR = f"{IMU}/lidar0"
 LIDAR_POINTS = f"{LIDAR}/points"
 IMU_PLOTS = "/plots/imu"
 IMU_ACCEL_PLOT = f"{IMU_PLOTS}/accel"
@@ -47,13 +56,22 @@ IMU_GYRO_PLOT = f"{IMU_PLOTS}/gyro"
 
 
 def stream_entity(name: str) -> str:
-    """Entity holding one image stream's frame of reference (extrinsics land here)."""
-    return f"{BODY}/{name}"
+    """Entity holding one image stream's frame of reference (its extrinsics land here)."""
+    return f"{IMU}/{name}"
 
 
 def image_entity(name: str) -> str:
-    """Entity holding one image stream's images."""
+    """Entity holding one image stream's pinhole model and images."""
     return f"{stream_entity(name)}/image"
+
+
+def axes_entity(frame: str) -> str:
+    """Child entity carrying a frame's coordinate triad, so it can be toggled on its own."""
+    return f"{frame}/axes"
+
+
+def mesh_entity(name: str) -> str:
+    return f"{MESHES}/{name}"
 
 
 def build(
@@ -61,30 +79,39 @@ def build(
     *,
     with_lidar: bool = True,
     with_imu: bool = True,
+    with_world: bool = False,
 ) -> rrb.Blueprint:
-    """Image views on the left; the lidar view and IMU plots on the right.
+    """Image views on the left; 3D views and IMU plots on the right.
 
-    Adapts to however many image streams the dataset has, and drops absent streams from
-    the layout rather than leaving empty panels.
+    ``with_world`` adds the world-frame 3D view that shows the trajectory, meshes, camera
+    frusta and the lidar carried into world coordinates. It shares a tab strip with the
+    lidar-fixed view rather than taking its own panel, since the two answer different
+    questions about the same data and are rarely wanted side by side.
     """
-    right: list[rrb.BlueprintPart] = []
-    if with_lidar:
-        right.append(
+
+    panels: list[rrb.BlueprintPart] = []
+
+    
+    views_3d: list[rrb.BlueprintPart] = []
+    if with_world:
+        views_3d.append(
             rrb.Spatial3DView(
-                origin=LIDAR,  # <- the lidar-fixed frame
-                name="lidar0 (sensor frame)",
+                origin=WORLD,
+                name="world",
                 line_grid=rrb.LineGrid3D(visible=True),
             )
         )
+
+    imu: list[rrb.BlueprintPart] = []
     if with_imu:
-        right.append(
+        imu.append(
             rrb.TimeSeriesView(
                 origin=IMU_ACCEL_PLOT,
                 name="acceleration [m/s^2]",
                 plot_legend=rrb.PlotLegend(corner=rrb.Corner2D.RightBottom),
             )
         )
-        right.append(
+        imu.append(
             rrb.TimeSeriesView(
                 origin=IMU_GYRO_PLOT,
                 name="angular rate [rad/s]",
@@ -92,32 +119,31 @@ def build(
             )
         )
 
-    panels: list[rrb.BlueprintPart] = []
+    if views_3d and not imu:
+        panels.append(views_3d[0])
+    elif views_3d and imu:
+        left: list[rrb.BlueprintPart] = [views_3d[0]]
+        left.append(rrb.Horizontal(*imu))
+        panels.append(rrb.Vertical(*left, row_shares=[4, 1]))
+    elif not views_3d and imu:
+        panels.append(rrb.Vertical(*imu))
+
     if streams:
         panels.append(
-            rrb.Grid(
+            rrb.Vertical(
                 contents=[
                     rrb.Spatial2DView(origin=image_entity(name), name=name)
                     for name in streams
                 ],
-                # Keep the tiles roughly square whatever the stream count is.
-                grid_columns=max(1, math.ceil(math.sqrt(len(streams)))),
                 name="images",
             )
         )
-    if right:
-        if len(right) > 1:
-            # Give the 3D view more height than the plots below it.
-            shares = [2] + [1] * (len(right) - 1) if with_lidar else [1] * len(right)
-            panels.append(rrb.Vertical(*right, row_shares=shares))
-        else:
-            panels.append(right[0])
 
     if not panels:
         return rrb.Blueprint(collapse_panels=False)
     if len(panels) == 1:
         return rrb.Blueprint(panels[0], collapse_panels=False)
     return rrb.Blueprint(
-        rrb.Horizontal(*panels, column_shares=[3, 2]),
+        rrb.Horizontal(*panels, column_shares=[4, 1]),
         collapse_panels=False,
     )

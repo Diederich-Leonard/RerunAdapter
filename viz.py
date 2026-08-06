@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Visualise a dataset in EuRoC/ASL layout in Rerun.
+"""Visualise a dataset in EuRoC/ASL layout in Rerun, optionally against SLAM results.
 
-Every image stream gets its own 2D view, the lidar is shown in a lidar-fixed 3D view, and
-the IMU is split into two graphs -- translational acceleration and rotational velocity --
-all sharing the dataset's own nanosecond timeline.
+Two modes:
 
-Nothing about the sensor count is hardcoded: image streams are discovered from the
-directory layout, so two cameras or five work the same way. One IMU and one lidar are
-assumed.
+*Dataset only* -- point it at a dataset root. Every image stream gets its own 2D view, the
+lidar is shown in a lidar-fixed 3D view, and the IMU is split into two graphs.
 
-This is the only module that talks to Rerun's logging API; ``euroc.py`` reads the dataset
-and ``blueprint.py`` owns the entity paths and the view layout.
+*With results* -- add ``--results`` and ``--config`` to overlay a SLAM run. A world-frame 3D
+view then shows the estimated trajectory, the submap meshes, every camera as a posed pinhole
+frustum, the lidar carried into world coordinates, and each frame (world, IMU, body,
+cameras, lidar) as a coordinate triad.
+
+Nothing about the sensor count is hardcoded: image streams are discovered from the directory
+layout, so two cameras or five work the same way. One IMU and one lidar are assumed.
+
+This is the only module that talks to Rerun's logging API; ``euroc.py`` reads the dataset,
+``results.py`` the trajectory and meshes, ``calib.py`` the extrinsics, and ``blueprint.py``
+owns the entity paths and the view layout.
 
 Usage:
     python viz.py <dataset_path>
     python viz.py <dataset_path> --max-scans 20
-    python viz.py <dataset_path> --lidar-frequency 10
+    python viz.py <dataset_path> --results <results_dir> --config <okvis2.yaml>
     python viz.py <dataset_path> --save scene.rrd
 """
 
@@ -30,15 +36,27 @@ import numpy as np
 import rerun as rr
 
 import blueprint as bp
+import calib
 import colormap
 import euroc
+import results
 
 #: Point size in UI points. Rerun reads a negative radius as a screen-space size, which
 #: keeps a sparse cloud visible whether you are 1 m or 100 m from it.
 POINT_RADIUS_UI = -1.0
 
-#: Per-axis series colours, shared by both IMU plots so x/y/z read the same in each.
+#: Per-axis colours, shared by the IMU plots and the coordinate triads so x/y/z read alike.
 AXIS_COLORS = ((230, 80, 80), (90, 200, 110), (90, 150, 240))
+
+#: Coordinate triad sizes in metres: the world origin gets a longer one so it stands out.
+FRAME_AXIS_LENGTH = 0.5
+WORLD_AXIS_LENGTH = 0.5
+
+#: How far in front of each camera to draw its frustum, in metres.
+IMAGE_PLANE_DISTANCE = 1.0
+
+TRAJECTORY_COLOR = (255, 190, 60)
+TRAJECTORY_RADIUS = 0.02
 
 LIDAR_COLOR_MODES = ("intensity", "ring", "z", "range", "none")
 
@@ -69,11 +87,26 @@ def parse_args() -> argparse.Namespace:
         help="Dataset root holding the stream folders (cam0/, imu0/, lidar0/, ...)",
     )
 
+    overlay = parser.add_argument_group("SLAM results")
+    overlay.add_argument(
+        "--results", type=Path, default=None, metavar="DIR",
+        help="result directory holding a *_trajectory.csv and mesh_*.ply files",
+    )
+    overlay.add_argument(
+        "--config", type=Path, default=None, metavar="FILE",
+        help="OKVIS config supplying the extrinsics (T_SC per camera, T_SL, T_BS)",
+    )
+    overlay.add_argument(
+        "--trajectory", type=Path, default=None, metavar="FILE",
+        help="explicit trajectory CSV, instead of the one picked from --results",
+    )
+
     streams = parser.add_argument_group("streams")
     streams.add_argument("--no-images", action="store_true", help="skip the image streams")
     streams.add_argument("--no-imu", action="store_true", help="skip the IMU")
     streams.add_argument("--no-lidar", action="store_true",
                          help="skip the lidar (the only slow part)")
+    streams.add_argument("--no-meshes", action="store_true", help="skip the submap meshes")
 
     lidar = parser.add_argument_group("lidar")
     lidar.add_argument(
@@ -88,6 +121,11 @@ def parse_args() -> argparse.Namespace:
 
     rr.script_add_args(parser)
     return parser.parse_args()
+
+
+# ----------------------------------------------------------------------------------
+# Time
+# ----------------------------------------------------------------------------------
 
 
 def set_time(timestamp_ns: int) -> None:
@@ -105,12 +143,130 @@ def time_column(timestamps_ns: np.ndarray) -> rr.TimeColumn:
     return rr.TimeColumn(bp.TIMELINE, duration=timestamps_ns.astype("timedelta64[ns]"))
 
 
+# ----------------------------------------------------------------------------------
+# Frames
+# ----------------------------------------------------------------------------------
+
+
+def log_transform(entity: str, T: np.ndarray) -> None:
+    """Log a static 4x4 transform mapping this entity's frame into its parent's."""
+    rr.log(
+        entity,
+        rr.Transform3D(translation=T[:3, 3], mat3x3=T[:3, :3]),
+        static=True,
+    )
+
+
+def log_frame_axes(frame: str, length: float = FRAME_AXIS_LENGTH) -> None:
+    """Draw a frame's coordinate triad.
+
+    Rerun 0.35's ``Transform3D`` has no ``axis_length``, so the axes are drawn explicitly.
+    They go on a child entity, which both keeps them separately toggleable and lets them
+    inherit the frame's transform, so the triad follows its frame for free.
+    """
+    rr.log(
+        bp.axes_entity(frame),
+        rr.Arrows3D(
+            vectors=np.eye(3) * length,
+            origins=np.zeros((3, 3)),
+            colors=list(AXIS_COLORS),
+            radii=[length * 0.03],
+        ),
+        static=True,
+    )
+
+
+def log_pose(timestamp_ns: int, position: np.ndarray, quaternion_xyzw: np.ndarray) -> None:
+    """Place the IMU frame S in the world at ``timestamp_ns``."""
+    set_time(timestamp_ns)
+    rr.log(bp.IMU, rr.Transform3D(translation=position,
+                                  quaternion=rr.Quaternion(xyzw=quaternion_xyzw)))
+
+
+def log_calibration(
+    calibration: calib.Calibration, streams: list[str], *, with_lidar: bool
+) -> None:
+    """Log the static rig: body, camera and lidar frames relative to the IMU."""
+    log_frame_axes(bp.IMU)
+
+    # The config gives T_BS, which maps IMU coordinates into the body frame. Hanging the
+    # body frame under the IMU needs the opposite direction.
+    log_transform(bp.BODY, calib.invert(calibration.T_BS))
+    log_frame_axes(bp.BODY)
+
+    for name, camera in zip(streams, calibration.cameras):
+        entity = bp.stream_entity(name)
+        log_transform(entity, camera.T_SC)
+        log_frame_axes(entity)
+        rr.log(
+            bp.image_entity(name),
+            rr.Pinhole(
+                image_from_camera=camera.K,
+                resolution=list(camera.resolution),
+                # OKVIS camera frames are x right, y down, z forward.
+                camera_xyz=rr.ViewCoordinates.RDF,
+                image_plane_distance=IMAGE_PLANE_DISTANCE,
+            ),
+            static=True,
+        )
+
+    if with_lidar:
+        if calibration.T_SL is not None:
+            log_transform(bp.LIDAR, calibration.T_SL)
+        log_frame_axes(bp.LIDAR)
+
+
+# ----------------------------------------------------------------------------------
+# Data
+# ----------------------------------------------------------------------------------
+
+
 def log_static_scene(with_lidar: bool) -> None:
-    """Declare frame orientations so the 3D view starts the right way up."""
+    """Declare frame orientations so the 3D views start the right way up."""
     rr.log(bp.WORLD, rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     if with_lidar:
         # Logged on the lidar entity itself because that entity is a view origin.
         rr.log(bp.LIDAR, rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+
+
+def log_trajectory(trajectory: results.Trajectory) -> None:
+    """Log the whole estimated path once, then every pose at its own timestamp."""
+    rr.log(
+        bp.TRAJECTORY,
+        rr.LineStrips3D(
+            [trajectory.positions.astype(np.float32)],
+            colors=[TRAJECTORY_COLOR],
+            radii=[TRAJECTORY_RADIUS],
+        ),
+        static=True,
+    )
+    for timestamp_ns, position, quaternion in zip(
+        trajectory.timestamps_ns, trajectory.positions, trajectory.quaternions, strict=True
+    ):
+        log_pose(int(timestamp_ns), position, quaternion)
+
+
+def log_meshes(paths: list[Path]) -> tuple[int, int]:
+    """Log every submap mesh as static geometry. Returns ``(meshes, vertices)``.
+
+    The vertices are already in world coordinates, so no transform is applied, and the
+    meshes are static so the whole map is present from the first frame onward.
+    """
+    vertices = 0
+    for index, path in enumerate(paths):
+        mesh = results.read_mesh_ply(path)
+        rr.log(
+            bp.mesh_entity(mesh.name),
+            rr.Mesh3D(
+                vertex_positions=mesh.vertices,
+                triangle_indices=mesh.triangles,
+                albedo_factor=(175, 175, 175, 40),
+                face_rendering="Front"
+            ),
+            static=True,
+        )
+        vertices += len(mesh)
+    return len(paths), vertices
 
 
 def log_imu(imu: euroc.ImuData) -> None:
@@ -178,6 +334,35 @@ def log_scan(scan: euroc.LidarScan, mode: str, rings: int) -> None:
             scan.xyz, colors=scan_colors(scan, mode, rings), radii=[POINT_RADIUS_UI]
         ),
     )
+
+
+# ----------------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------------
+
+
+def load_results(args: argparse.Namespace) -> tuple[results.Trajectory | None, list[Path]]:
+    """Resolve the trajectory and mesh list from ``--results`` / ``--trajectory``."""
+    trajectory_path = args.trajectory
+    meshes: list[Path] = []
+
+    if args.results is not None:
+        if not args.results.is_dir():
+            raise NotADirectoryError(f"{args.results} is not a directory")
+        if trajectory_path is None:
+            trajectory_path = results.find_trajectory(args.results)
+            if trajectory_path is None:
+                raise FileNotFoundError(f"no *_trajectory.csv in {args.results}")
+        if not args.no_meshes:
+            meshes = results.find_meshes(args.results)
+
+    trajectory = None
+    if trajectory_path is not None:
+        trajectory = results.read_trajectory(trajectory_path)
+        print(f"  results  {trajectory_path.name}: {len(trajectory)} poses")
+    if meshes:
+        print(f"           {len(meshes)} mesh files")
+    return trajectory, meshes
 
 
 def main() -> int:
@@ -266,11 +451,46 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    # ---- results and calibration ----------------------------------------------------
+    try:
+        trajectory, mesh_paths = load_results(args)
+        calibration = calib.load(args.config) if args.config is not None else None
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if calibration is not None:
+        print(
+            f"  config   {args.config.name}: {len(calibration.cameras)} cameras, "
+            f"T_SL {'present' if calibration.T_SL is not None else 'absent'}"
+        )
+        if len(calibration.cameras) != len(images) and images:
+            print(
+                f"warning: {len(images)} image streams but {len(calibration.cameras)} "
+                f"cameras in the config; pairing the first "
+                f"{min(len(images), len(calibration.cameras))} in order",
+                file=sys.stderr,
+            )
+        if lidar_reader is not None and calibration.T_SL is None:
+            print(
+                "warning: the config has no lidar.T_SL, so the lidar is left coincident "
+                "with the IMU frame in the world view",
+                file=sys.stderr,
+            )
+    if trajectory is None and (calibration is not None or mesh_paths):
+        print(
+            "warning: no trajectory, so the rig stays at the world origin",
+            file=sys.stderr,
+        )
+
+    with_world = trajectory is not None or calibration is not None or bool(mesh_paths)
+
     # ---- connect to Rerun ----------------------------------------------------------
     layout = bp.build(
         list(images),
         with_lidar=lidar_reader is not None,
         with_imu=imu is not None and len(imu) > 0,
+        with_world=with_world,
     )
     rr.script_setup(args, "euroc_viz", default_blueprint=layout)
     # Force the layout active rather than relying on default_blueprint alone. The viewer
@@ -281,6 +501,27 @@ def main() -> int:
     started = time.perf_counter()
 
     log_static_scene(with_lidar=lidar_reader is not None)
+    if with_world:
+        log_frame_axes(bp.WORLD, WORLD_AXIS_LENGTH)
+    if calibration is not None:
+        log_calibration(calibration, list(images), with_lidar=lidar_reader is not None)
+
+    # Poses are interpolated onto the timestamp of whatever is being placed. The trajectory
+    # runs at the estimator's rate, so without this a lidar scan would inherit a pose up to
+    # one estimator period stale, offsetting the whole cloud in the world view.
+    poses = results.PoseInterpolator(trajectory) if trajectory is not None else None
+
+    def place(timestamp_ns: int) -> None:
+        if poses is not None:
+            position, quaternion = poses.at(timestamp_ns)
+            log_pose(timestamp_ns, position, quaternion)
+
+    if trajectory is not None:
+        log_trajectory(trajectory)
+
+    if mesh_paths:
+        count, vertices = log_meshes(mesh_paths)
+        print(f"  meshes   {count:>7} submaps   {vertices / 1e6:.1f}M vertices")
 
     # ---- IMU -----------------------------------------------------------------------
     if imu is not None and len(imu):
@@ -293,6 +534,7 @@ def main() -> int:
     # ---- image streams -------------------------------------------------------------
     for name, index in images.items():
         for timestamp_ns, path in zip(index.timestamps_ns, index.paths, strict=True):
+            place(int(timestamp_ns))
             set_time(int(timestamp_ns))
             rr.log(bp.image_entity(name), rr.EncodedImage(path=path))
         note = f"   ({index.missing} image files missing)" if index.missing else ""
@@ -313,6 +555,7 @@ def main() -> int:
                 # run, so a given ring index keeps one colour. Every azimuth firing covers
                 # all rings, so even a partial first interval sees the full set.
                 rings = int(scan.ring.max()) + 1
+            place(scan.timestamp_ns)
             log_scan(scan, args.lidar_color, rings)
             scan_count += 1
             point_count += len(scan)

@@ -20,6 +20,19 @@ python3 ./viz.py <dataset_path>
 
 The dataset root is the folder holding the stream directories.
 
+Add `--results` and `--config` to overlay a SLAM run:
+
+```bash
+python3 ./viz.py <dataset_path> \
+    --results ../../results \
+    --config ../../src/okvis2-x-private/config/elios3-eth/okvis2.yaml
+```
+
+That adds a world-frame 3D view with the estimated trajectory, the submap meshes, every
+camera as a posed pinhole frustum, the lidar carried into world coordinates, and each frame
+as a coordinate triad. `--results` picks the most refined `*_trajectory.csv` it finds
+(`-final-ba` over `-final` over the realtime one); `--trajectory FILE` overrides that.
+
 The viewer is spawned automatically. Over SSH use `--serve`, or write a file and open it
 locally:
 
@@ -30,13 +43,41 @@ rerun scene.rrd
 
 ## Entity hierarchy
 
+Rerun composes transforms down the entity path, so every sensor is logged in its own native
+frame and the viewer does the placing — no point cloud or mesh is transformed by hand.
+
 ```
 /world                        static ViewCoordinates (z up)
-/world/body/<stream>/image    EncodedImage per frame   -> one 2D view per image stream
-/world/body/lidar0/points     Points3D per scan        -> view "lidar0 (sensor frame)"
-/plots/imu/accel/{x,y,z}      scalar series, columnar  -> view "acceleration [m/s^2]"
-/plots/imu/gyro/{x,y,z}                                -> view "angular rate [rad/s]"
+/world/axes                   static Arrows3D           -> world frame triad
+/world/trajectory             static LineStrips3D       -> the whole estimated path
+/world/mesh/<name>            static Mesh3D             -> vertices already in world frame
+/world/imu                    Transform3D per pose      -> T_WS from the trajectory
+/world/imu/body               static Transform3D        -> T_SB, i.e. inverse of T_BS
+/world/imu/<stream>           static Transform3D        -> T_SC for that camera
+/world/imu/<stream>/image     static Pinhole + EncodedImage per frame
+/world/imu/lidar0             static Transform3D        -> T_SL
+/world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
+/plots/imu/accel/{x,y,z}      scalar series, columnar   -> view "acceleration [m/s^2]"
+/plots/imu/gyro/{x,y,z}                                 -> view "angular rate [rad/s]"
 ```
+
+The IMU frame `S` is the moving root, because an OKVIS calibration expresses both cameras
+(`T_SC`) and lidar (`T_SL`) relative to the IMU, and the trajectory gives the IMU's pose in
+the world (`T_WS`). `T_BS` runs the other way, so the body frame is placed with its inverse.
+
+Two consequences:
+
+- **The lidar is logged once and viewable in two frames.** A spatial view renders relative
+  to its origin and ignores transforms at or above it, so the view rooted at
+  `/world/imu/lidar0` is lidar-fixed, while the one rooted at `/world` shows the same points
+  carried out by `T_SL` then `T_WS`. They share a tab strip.
+- **Without a trajectory or config nothing changes structurally.** No `Transform3D` is
+  logged, every frame collapses to identity, and the same paths still work — which is what
+  lets both modes share one hierarchy.
+
+Poses are interpolated (lerp + slerp) onto the timestamp of whatever is being placed. The
+trajectory runs at the estimator's rate, so without that a lidar scan would inherit a pose
+up to one estimator period stale, offsetting the whole cloud.
 
 ## Lidar frequency
 
@@ -66,10 +107,13 @@ monotonic normalisation over their whole domain rather than a linear window with
 
 | Flag | Meaning |
 |---|---|
+| `--results DIR` | result directory with `*_trajectory.csv` and `mesh_*.ply` |
+| `--config FILE` | OKVIS config supplying `T_SC`, `T_SL`, `T_BS` |
+| `--trajectory FILE` | explicit trajectory, instead of the one picked from `--results` |
 | `--lidar-frequency HZ` | scan interval is 1/HZ (default `10`) |
 | `--max-scans N` | stop after N scans (default: whole file) |
 | `--lidar-color` | `intensity` (default), `ring`, `z`, `range`, `none` |
-| `--no-images`, `--no-imu`, `--no-lidar` | skip a stream |
+| `--no-images`, `--no-imu`, `--no-lidar`, `--no-meshes` | skip a stream |
 | `--save F.rrd`, `--serve`, `--connect`, `--headless` | standard Rerun output flags |
 
 ## Code layout
@@ -77,6 +121,8 @@ monotonic normalisation over their whole domain rather than a linear window with
 ```
 viz.py         CLI, the logging loop, and the only Rerun logging calls
 euroc.py       stream discovery + readers (images, IMU, streaming lidar) — no Rerun
+results.py     trajectory and submap mesh readers, pose interpolation — no Rerun
+calib.py       OKVIS config -> intrinsics and T_SC / T_SL / T_BS — no Rerun
 blueprint.py   entity paths and the default view layout
 colormap.py    turbo table and the fixed value->colour mappings
 ```
@@ -96,8 +142,17 @@ encoded bytes are passed through untouched and the viewer decodes them.
 
 ## Known limitations
 
-- **No extrinsics, so no rig geometry.** No transforms are logged, so all frames are
-  identity: image streams are 2D views only (no frusta), and the lidar cannot be placed in
-  a world frame. Calibration generally lives outside these datasets.
+- **Without `--config` there is no rig geometry.** No transforms are logged, so all frames
+  are identity: image streams are 2D views only (no frusta), and the lidar cannot be placed
+  in the world. Calibration generally lives outside these datasets.
+- **Camera frusta follow the discovered image streams**, paired with the config's cameras in
+  order, so `--no-images` also removes them. A config with a different camera count than the
+  dataset has streams pairs the first *n* and warns.
+- **`rr.Pinhole` carries no distortion model.** The frusta and any 2D overlay assume a plain
+  pinhole while the logged pixels are still distorted, which these configs are
+  (`distortion_type: equidistant`).
+- **A config without `lidar.T_SL` leaves the lidar at the IMU frame** and warns; not every
+  OKVIS config has that section.
 - **No motion compensation within a scan**, and the whole scan is logged at the start of
   its interval.
+- **The IMU is not drawn in the 3D view**, only as the frame triad and the two graphs.
