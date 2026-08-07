@@ -209,8 +209,134 @@ class Mesh:
         return len(self.vertices)
 
 
+# PLY scalar type names, including the explicitly sized spellings, as numpy codes.
+_PLY_TYPES = {
+    "char": "i1", "int8": "i1",
+    "uchar": "u1", "uint8": "u1",
+    "short": "i2", "int16": "i2",
+    "ushort": "u2", "uint16": "u2",
+    "int": "i4", "int32": "i4",
+    "uint": "u4", "uint32": "u4",
+    "float": "f4", "float32": "f4",
+    "double": "f8", "float64": "f8",
+}
+
+
+@dataclass
+class _Element:
+    """One ``element`` block of a PLY header."""
+
+    name: str
+    count: int
+    # (property name, scalar type) for a plain property, or (name, (count type, item
+    # type)) for a ``property list``.
+    properties: list[tuple[str, str | tuple[str, str]]]
+
+
+def _parse_ply_header(path: Path) -> tuple[str, list[_Element], int]:
+    """``(format, elements, data_offset)`` for a PLY file.
+
+    The offset is a byte count rather than a line count so that the binary payload can be
+    seeked to directly; the ASCII path turns it back into a line count itself.
+    """
+    fmt: str | None = None
+    elements: list[_Element] = []
+    with path.open("rb") as handle:
+        while True:
+            line = handle.readline()
+            if not line:
+                raise ValueError(f"{path}: no end_header found")
+            fields = line.decode("ascii", "replace").split()
+            if not fields:
+                continue
+            keyword = fields[0]
+            if keyword == "format":
+                fmt = fields[1]
+            elif keyword == "element":
+                elements.append(_Element(fields[1], int(fields[2]), []))
+            elif keyword == "property":
+                if not elements:
+                    raise ValueError(f"{path}: property outside of an element")
+                if fields[1] == "list":
+                    elements[-1].properties.append((fields[4], (fields[2], fields[3])))
+                else:
+                    elements[-1].properties.append((fields[2], fields[1]))
+            elif keyword == "end_header":
+                return fmt or "", elements, handle.tell()
+
+
+def _scalar_dtype(path: Path, byte_order: str, type_name: str) -> str:
+    try:
+        return byte_order + _PLY_TYPES[type_name]
+    except KeyError:
+        raise ValueError(f"{path}: unsupported PLY type {type_name!r}") from None
+
+
+def _read_binary_mesh(
+    path: Path, byte_order: str, elements: list[_Element], offset: int, want_faces: bool
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Vertices and, if asked for, triangles of a binary PLY.
+
+    Elements are fixed-width records laid out back to back, so each block is read straight
+    into a structured array and the columns of interest are picked out afterwards. That
+    means walking the elements in order even when only the two of them matter: a block that
+    is skipped still has to be measured to find where the next one starts.
+    """
+    data = np.memmap(path, dtype=np.uint8, mode="r", offset=offset)
+    vertices: np.ndarray | None = None
+    triangles: np.ndarray | None = None
+    cursor = 0
+
+    for element in elements:
+        lists = [(name, spec) for name, spec in element.properties if isinstance(spec, tuple)]
+        if lists and element.name != "face":
+            raise ValueError(
+                f"{path}: cannot size element {element.name!r}, which has a list property"
+            )
+
+        if element.name == "face":
+            if not want_faces:
+                break  # nothing after the faces is read, so the layout no longer matters
+            if len(element.properties) != 1 or not lists:
+                raise ValueError(f"{path}: expected a single face list property")
+            count_type, index_type = lists[0][1]
+            # Only triangles are supported, which lets the variable-length list be read as
+            # a fixed-width record; the counts are checked below rather than assumed.
+            record = np.dtype([
+                ("count", _scalar_dtype(path, byte_order, count_type)),
+                ("indices", _scalar_dtype(path, byte_order, index_type), 3),
+            ])
+            faces = np.frombuffer(data, dtype=record, count=element.count, offset=cursor)
+            if np.any(faces["count"] != 3):
+                raise ValueError(f"{path}: only triangular faces are supported")
+            triangles = faces["indices"].astype(np.int32)
+            break
+
+        record = np.dtype([
+            (name, _scalar_dtype(path, byte_order, spec)) for name, spec in element.properties
+        ])
+        if element.name == "vertex":
+            block = np.frombuffer(data, dtype=record, count=element.count, offset=cursor)
+            missing = [axis for axis in "xyz" if axis not in record.names]
+            if missing:
+                raise ValueError(f"{path}: vertex element is missing {', '.join(missing)}")
+            vertices = np.stack(
+                [block["x"], block["y"], block["z"]], axis=1
+            ).astype(np.float32)
+            if not want_faces:
+                break
+        cursor += element.count * record.itemsize
+
+    if vertices is None:
+        raise ValueError(f"{path}: no vertex element")
+    return vertices, triangles
+
+
 def read_mesh_ply(path: str | Path) -> Mesh:
-    """Read an ASCII PLY mesh, keeping only the vertex coordinates and faces.
+    """Read a PLY mesh, keeping only the vertex coordinates and faces.
+
+    ASCII and both binary byte orders are accepted, since the two producers in play do not
+    agree: the OKVIS submap exports are ASCII, the nvblox ones binary little-endian.
 
     Vertex colours are ignored: the exports these come from write them, but write them all
     zero, so honouring them would render every mesh black.
@@ -221,45 +347,37 @@ def read_mesh_ply(path: str | Path) -> Mesh:
     avoids parsing and transferring a third of the file for no gain.
     """
     path = Path(path)
-    header: list[str] = []
-    with path.open("rb") as handle:
-        while True:
-            line = handle.readline()
-            if not line:
-                raise ValueError(f"{path}: no end_header found")
-            text = line.decode("ascii", "replace").strip()
-            header.append(text)
-            if text == "end_header":
-                break
+    fmt, elements, data_offset = _parse_ply_header(path)
 
-    if not any(line.startswith("format ascii") for line in header):
-        raise ValueError(f"{path}: only ASCII PLY is supported")
-
-    counts: dict[str, int] = {}
-    for line in header:
-        if line.startswith("element"):
-            _, name, number = line.split()[:3]
-            counts[name] = int(number)
-
+    counts = {element.name: element.count for element in elements}
     num_vertices = counts.get("vertex", 0)
     num_faces = counts.get("face", 0)
     if num_vertices == 0:
         raise ValueError(f"{path}: no vertices")
 
-    header_lines = len(header)
-    vertices = np.loadtxt(
-        path, skiprows=header_lines, max_rows=num_vertices, usecols=(0, 1, 2),
-        dtype=np.float32, ndmin=2,
-    )
+    # Vertices are shared only when the count rules out a plain triangle list.
+    want_faces = bool(num_faces) and num_vertices != 3 * num_faces
 
-    triangles = None
-    if num_faces and num_vertices != 3 * num_faces:
-        # Vertices are shared, so the face list is needed. Column 0 is the vertex count per
-        # face, which is assumed to be 3.
-        triangles = np.loadtxt(
-            path, skiprows=header_lines + num_vertices, max_rows=num_faces,
-            usecols=(1, 2, 3), dtype=np.int32, ndmin=2,
+    if fmt == "binary_little_endian":
+        vertices, triangles = _read_binary_mesh(path, "<", elements, data_offset, want_faces)
+    elif fmt == "binary_big_endian":
+        vertices, triangles = _read_binary_mesh(path, ">", elements, data_offset, want_faces)
+    elif fmt == "ascii":
+        with path.open("rb") as handle:
+            header_lines = handle.read(data_offset).count(b"\n")
+        vertices = np.loadtxt(
+            path, skiprows=header_lines, max_rows=num_vertices, usecols=(0, 1, 2),
+            dtype=np.float32, ndmin=2,
         )
+        triangles = None
+        if want_faces:
+            # Column 0 is the vertex count per face, which is assumed to be 3.
+            triangles = np.loadtxt(
+                path, skiprows=header_lines + num_vertices, max_rows=num_faces,
+                usecols=(1, 2, 3), dtype=np.int32, ndmin=2,
+            )
+    else:
+        raise ValueError(f"{path}: unsupported PLY format {fmt!r}")
 
     return Mesh(name=path.stem, vertices=vertices, triangles=triangles)
 
