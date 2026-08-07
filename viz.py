@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from pathlib import Path
@@ -72,6 +73,15 @@ def positive_float(text: str) -> float:
     return value
 
 
+def mesh_regex(text: str) -> str:
+    """Reject a malformed regex at parse time, rather than on the first directory scan."""
+    try:
+        re.compile(text)
+    except re.error as error:
+        raise argparse.ArgumentTypeError(f"not a valid regex: {error}") from None
+    return text
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -101,6 +111,13 @@ def parse_args() -> argparse.Namespace:
         "--trajectory", type=Path, default=None, metavar="FILE",
         help="trajectory to move the sensors along, instead of the one picked from "
              "--results; accepts an OKVIS CSV or a reference file, and works on its own",
+    )
+    overlay.add_argument(
+        "--mesh-regex", type=mesh_regex, default=results.DEFAULT_MESH_PATTERN,
+        metavar="REGEX",
+        help="regex a mesh filename must match in full to be loaded from --results; a "
+             "result directory can hold more than one set "
+             f"(default: {results.DEFAULT_MESH_PATTERN})",
     )
     overlay.add_argument(
         "--groundtruth", type=Path, default=None, metavar="FILE",
@@ -384,7 +401,7 @@ def load_results(
             if trajectory_path is None:
                 raise FileNotFoundError(f"no *_trajectory.csv in {args.results}")
         if not args.no_meshes:
-            meshes = results.find_meshes(args.results)
+            meshes = results.find_meshes(args.results, args.mesh_regex)
 
     trajectory = (
         results.read_trajectory(trajectory_path) if trajectory_path is not None else None

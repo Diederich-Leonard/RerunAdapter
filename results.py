@@ -44,8 +44,22 @@ def find_trajectory(results_dir: Path) -> Path | None:
     return min(candidates, key=_trajectory_rank) if candidates else None
 
 
-def find_meshes(results_dir: Path) -> list[Path]:
-    return sorted(results_dir.glob("mesh_*.ply"), key=lambda p: _natural_key(p.name))
+DEFAULT_MESH_PATTERN = r"mesh_.*\.ply"
+
+
+def find_meshes(results_dir: Path, pattern: str | re.Pattern = DEFAULT_MESH_PATTERN) -> list[Path]:
+    """Mesh files in ``results_dir`` whose *name* fully matches ``pattern``.
+
+    A regex rather than a glob, and matched in full rather than searched, because a single
+    result directory can hold several mesh sets whose names share a suffix -- supereight
+    writes ``mesh_*.ply`` next to nvblox's ``nvblox_mesh_*.ply``. Full matching is what
+    keeps the default from picking up both.
+    """
+    matches = re.compile(pattern).fullmatch
+    return sorted(
+        (path for path in results_dir.iterdir() if path.is_file() and matches(path.name)),
+        key=lambda p: _natural_key(p.name),
+    )
 
 
 # ----------------------------------------------------------------------------------

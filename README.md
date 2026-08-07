@@ -135,6 +135,7 @@ monotonic normalisation over their whole domain rather than a linear window with
 | Flag | Meaning |
 |---|---|
 | `--results DIR` | result directory with `*_trajectory.csv` and `mesh_*.ply` |
+| `--mesh-regex REGEX` | filename a mesh must fully match (default `mesh_.*\.ply`) |
 | `--config FILE` | OKVIS config supplying `T_SC`, `T_SL`, `T_BS` |
 | `--trajectory FILE` | explicit trajectory, instead of the one picked from `--results` |
 | `--groundtruth FILE` | reference trajectory, rigidly aligned before plotting |
