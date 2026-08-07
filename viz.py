@@ -20,7 +20,7 @@ owns the entity paths and the view layout.
 
 Usage:
     python viz.py <dataset_path>
-    python viz.py <dataset_path> --max-scans 20
+    python viz.py <dataset_path> --start 30 --duration 20
     python viz.py <dataset_path> --results <results_dir> --config <okvis2.yaml>
     python viz.py <dataset_path> --save scene.rrd
 """
@@ -61,7 +61,7 @@ TRAJECTORY_RADIUS = 0.1
 
 LIDAR_COLOR_MODES = ("intensity", "ring", "z", "range", "none")
 
-#: Advise using --max-scans above this file size, since the default reads everything.
+#: Advise narrowing the window above this file size, since the default reads it all.
 LARGE_LIDAR_BYTES = 4 * 1024**3
 
 
@@ -115,14 +115,22 @@ def parse_args() -> argparse.Namespace:
                          help="skip the lidar (the only slow part)")
     streams.add_argument("--no-meshes", action="store_true", help="skip the submap meshes")
 
+    window = parser.add_argument_group("time window")
+    window.add_argument(
+        "--start", type=float, default=0.0, metavar="SEC",
+        help="seconds after the beginning of the sensor data to start loading (default: 0)",
+    )
+    window.add_argument(
+        "--duration", type=positive_float, default=None, metavar="SEC",
+        help="seconds of sensor data to load (default: all of it)",
+    )
+
     lidar = parser.add_argument_group("lidar")
     lidar.add_argument(
         "--lidar-frequency", type=positive_float, default=10.0, metavar="HZ",
         help="rotation rate; all points within one 1/HZ interval form one point cloud "
              "(default: 10)",
     )
-    lidar.add_argument("--max-scans", type=int, default=None,
-                       help="stop after N scans (default: read the whole file)")
     lidar.add_argument("--lidar-color", default="intensity", choices=LIDAR_COLOR_MODES,
                        help="per-point colouring (default: intensity)")
 
@@ -447,6 +455,51 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    # ---- resolve the time window -----------------------------------------------------
+    # The window restricts the *sensor* streams only. Trajectories, meshes and the static
+    # transforms are always loaded whole, so the estimated path and the map stay complete
+    # however narrow a slice of measurements is being looked at.
+    sensor_spans: list[tuple[int, int]] = []
+    for index in images.values():
+        if len(index):
+            sensor_spans.append((int(index.timestamps_ns[0]), int(index.timestamps_ns[-1])))
+    if imu is not None and len(imu):
+        sensor_spans.append((int(imu.timestamps_ns[0]), int(imu.timestamps_ns[-1])))
+    if lidar_reader is not None:
+        try:
+            sensor_spans.append(lidar_reader.time_range())
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    window_start_ns: int | None = None
+    window_end_ns: int | None = None
+    if sensor_spans and (args.start > 0.0 or args.duration is not None):
+        # Offsets from the first measurement, rather than absolute clock values: dataset
+        # clocks range from ~250 s of uptime to Unix epoch nanoseconds, so an absolute
+        # window would mean something different for every dataset.
+        data_start_ns = min(span[0] for span in sensor_spans)
+        data_end_ns = max(span[1] for span in sensor_spans)
+        window_start_ns = data_start_ns + int(round(args.start * euroc.NS_PER_S))
+        if args.duration is not None:
+            window_end_ns = window_start_ns + int(round(args.duration * euroc.NS_PER_S))
+
+        if window_start_ns > data_end_ns:
+            print(
+                f"warning: --start {args.start:g} puts the window past the last "
+                f"measurement; only "
+                f"{(data_end_ns - data_start_ns) / euroc.NS_PER_S:.1f} s of sensor data "
+                f"exist, so no images, IMU or lidar will be loaded",
+                file=sys.stderr,
+            )
+
+        images = {
+            name: index.window(window_start_ns, window_end_ns)
+            for name, index in images.items()
+        }
+        if imu is not None:
+            imu = imu.window(window_start_ns, window_end_ns)
+
     # ---- report the timeline extent before logging anything -------------------------
     spans: list[tuple[int, int]] = []
     for index in images.values():
@@ -455,11 +508,8 @@ def main() -> int:
     if imu is not None and len(imu):
         spans.append((int(imu.timestamps_ns[0]), int(imu.timestamps_ns[-1])))
     if lidar_reader is not None:
-        try:
-            spans.append(lidar_reader.time_range())
-        except (OSError, ValueError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
+        spans.append(sensor_spans[-1] if window_start_ns is None else
+                     (window_start_ns, window_end_ns or sensor_spans[-1][1]))
     if trajectory is not None and len(trajectory):
         spans.append((int(trajectory.timestamps_ns[0]), int(trajectory.timestamps_ns[-1])))
 
@@ -479,6 +529,14 @@ def main() -> int:
             f"{end_ns / euroc.NS_PER_S:.3f} s "
             f"({(end_ns - start_ns) / euroc.NS_PER_S:.1f} s)"
         )
+    if window_start_ns is not None:
+        end_text = (
+            f"{window_end_ns / euroc.NS_PER_S:.3f}" if window_end_ns is not None else "end"
+        )
+        print(
+            f"  window   {window_start_ns / euroc.NS_PER_S:.3f} .. {end_text} s "
+            f"(sensors only)"
+        )
     if trajectory is not None:
         print(f"  traj     {trajectory_path.name}: {len(trajectory)} poses")
     if mesh_paths:
@@ -489,10 +547,10 @@ def main() -> int:
             f"  lidar    {size / 1e9:.1f} GB, {args.lidar_frequency:g} Hz "
             f"-> {period_ns / 1e6:g} ms per scan"
         )
-        if size > LARGE_LIDAR_BYTES and args.max_scans is None:
+        if size > LARGE_LIDAR_BYTES and window_end_ns is None:
             print(
                 f"warning: reading all of {lidar_reader.path.name} "
-                f"({size / 1e9:.0f} GB); pass --max-scans N to stop early",
+                f"({size / 1e9:.0f} GB); pass --duration SEC to load less",
                 file=sys.stderr,
             )
 
@@ -608,7 +666,7 @@ def main() -> int:
         rings = 1
         lidar_started = time.perf_counter()
 
-        for scan in lidar_reader.scans(max_scans=args.max_scans):
+        for scan in lidar_reader.scans(start_ns=window_start_ns, end_ns=window_end_ns):
             if scan_count == 0 and len(scan):
                 # Fix the ring-colour domain from the first scan and keep it for the whole
                 # run, so a given ring index keeps one colour. Every azimuth firing covers

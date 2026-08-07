@@ -45,6 +45,19 @@ def _natural_key(name: str) -> tuple:
     return tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name))
 
 
+def _window_slice(
+    timestamps_ns: np.ndarray, start_ns: int | None, end_ns: int | None
+) -> tuple[int, int]:
+    """Index range of ``timestamps_ns`` falling inside ``[start_ns, end_ns]``."""
+    lo = 0 if start_ns is None else int(np.searchsorted(timestamps_ns, start_ns, "left"))
+    hi = (
+        len(timestamps_ns)
+        if end_ns is None
+        else int(np.searchsorted(timestamps_ns, end_ns, "right"))
+    )
+    return lo, hi
+
+
 # ----------------------------------------------------------------------------------
 # Discovery
 # ----------------------------------------------------------------------------------
@@ -111,6 +124,16 @@ class ImageIndex:
     def __len__(self) -> int:
         return len(self.timestamps_ns)
 
+    def window(self, start_ns: int | None, end_ns: int | None) -> ImageIndex:
+        """Restrict to frames inside ``[start_ns, end_ns]``."""
+        lo, hi = _window_slice(self.timestamps_ns, start_ns, end_ns)
+        return ImageIndex(
+            name=self.name,
+            timestamps_ns=self.timestamps_ns[lo:hi],
+            paths=self.paths[lo:hi],
+            missing=self.missing,
+        )
+
 
 def read_image_index(stream_dir: str | Path) -> ImageIndex:
     """Read ``<stream>/data.csv`` and pair each timestamp with its file in ``data/``.
@@ -170,6 +193,15 @@ class ImuData:
 
     def __len__(self) -> int:
         return len(self.timestamps_ns)
+
+    def window(self, start_ns: int | None, end_ns: int | None) -> ImuData:
+        """Restrict to samples inside ``[start_ns, end_ns]``."""
+        lo, hi = _window_slice(self.timestamps_ns, start_ns, end_ns)
+        return ImuData(
+            timestamps_ns=self.timestamps_ns[lo:hi],
+            gyro=self.gyro[lo:hi],
+            accel=self.accel[lo:hi],
+        )
 
 
 def read_imu(csv_path: str | Path) -> ImuData:
@@ -265,8 +297,8 @@ class LidarScanReader:
             raise ValueError(f"{self.path}: could not read a complete row from the tail")
         return first, int(complete[-1].split(b",")[0])
 
-    def _chunks(self):
-        """Yield ``(N, 6)`` float64 blocks of rows, streaming through the file."""
+    def _line_chunks(self):
+        """Yield lists of raw data lines, streaming through the file."""
         with self.path.open("rb") as handle:
             first_line = handle.readline()
             if not first_line.startswith(b"#"):
@@ -275,21 +307,58 @@ class LidarScanReader:
                 lines = list(itertools.islice(handle, self.chunk_rows))
                 if not lines:
                     return  # clean EOF
-                yield np.loadtxt(lines, delimiter=",", dtype=np.float64, ndmin=2)
+                yield lines
                 del lines
 
-    def scans(self, max_scans: int | None = None):
-        """Yield one :class:`LidarScan` per ``period_ns`` interval, in file order.
+    @staticmethod
+    def _timestamp_of(line: bytes) -> int | None:
+        """Timestamp of one row, read straight from the bytes.
+
+        Returns ``None`` if the field will not parse, so a truncated final line makes the
+        caller fall back to parsing rather than mis-skipping.
+        """
+        try:
+            return int(line.split(b",", 1)[0].strip())
+        except ValueError:
+            return None
+
+    def scans(self, start_ns: int | None = None, end_ns: int | None = None):
+        """Yield one :class:`LidarScan` per ``period_ns`` interval within a time window.
 
         Rows are read in chunks and cut wherever the interval index changes; a scan that
         straddles a chunk boundary is accumulated across chunks, so the interval, not the
         read size, decides where scans begin and end.
+
+        The file is sorted by time, so a chunk lying wholly before the window is skipped
+        without being parsed and reading stops at the first chunk past its end. Only the
+        cheap leading timestamp field is inspected to decide, which is what makes a narrow
+        window affordable on a file far too large to read in full.
         """
         emitted = 0
         pending: list[np.ndarray] = []
         bucket: int | None = None
 
-        for rows in self._chunks():
+        for lines in self._line_chunks():
+            if end_ns is not None:
+                first = self._timestamp_of(lines[0])
+                if first is not None and first > end_ns:
+                    break
+            if start_ns is not None:
+                last = self._timestamp_of(lines[-1])
+                if last is not None and last < start_ns:
+                    continue
+
+            rows = np.loadtxt(lines, delimiter=",", dtype=np.float64, ndmin=2)
+            if start_ns is not None or end_ns is not None:
+                keep = np.ones(len(rows), dtype=bool)
+                if start_ns is not None:
+                    keep &= rows[:, 0] >= start_ns
+                if end_ns is not None:
+                    keep &= rows[:, 0] <= end_ns
+                rows = rows[keep]
+                if len(rows) == 0:
+                    continue
+
             # Interval index per row. float64 rounding is order-preserving, so this stays
             # non-decreasing even for epoch-nanosecond timestamps (which exceed float64's
             # exact-integer range and so carry ~256 ns of rounding); a point can only ever
@@ -308,11 +377,9 @@ class LidarScanReader:
 
                 yield self._build_scan(emitted, bucket, pending)
                 emitted += 1
-                if max_scans is not None and emitted >= max_scans:
-                    return
                 pending, bucket = [segment], segment_bucket
 
-        if pending and (max_scans is None or emitted < max_scans):
+        if pending:
             yield self._build_scan(emitted, bucket, pending)
 
     def _build_scan(self, index: int, bucket: int, parts: list[np.ndarray]) -> LidarScan:

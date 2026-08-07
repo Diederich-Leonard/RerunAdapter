@@ -40,6 +40,12 @@ so a dataset can be viewed moving through the world before any SLAM output exist
 python3 ./viz.py <dataset_path> --trajectory <groundtruth.txt> --config <okvis2.yaml>
 ```
 
+`--start` and `--duration` (seconds, offsets from the first measurement) limit how much
+**sensor** data is loaded — images, IMU and lidar. Trajectories, meshes and the static
+transforms always load whole, so the estimated path and the map stay complete however narrow
+a slice of measurements you look at. This is the lever for datasets big enough that the
+viewer starts dropping data.
+
 The viewer is spawned automatically. Over SSH use `--serve`, or write a file and open it
 locally:
 
@@ -133,7 +139,8 @@ monotonic normalisation over their whole domain rather than a linear window with
 | `--trajectory FILE` | explicit trajectory, instead of the one picked from `--results` |
 | `--groundtruth FILE` | reference trajectory, rigidly aligned before plotting |
 | `--lidar-frequency HZ` | scan interval is 1/HZ (default `10`) |
-| `--max-scans N` | stop after N scans (default: whole file) |
+| `--start SEC` | skip this many seconds of sensor data (default `0`) |
+| `--duration SEC` | seconds of sensor data to load (default: all) |
 | `--lidar-color` | `intensity` (default), `ring`, `z`, `range`, `none` |
 | `--no-images`, `--no-imu`, `--no-lidar`, `--no-meshes` | skip a stream |
 | `--save F.rrd`, `--serve`, `--connect`, `--headless` | standard Rerun output flags |
