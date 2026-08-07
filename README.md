@@ -33,6 +33,13 @@ camera as a posed pinhole frustum, the lidar carried into world coordinates, and
 as a coordinate triad. `--results` picks the most refined `*_trajectory.csv` it finds
 (`-final-ba` over `-final` over the realtime one); `--trajectory FILE` overrides that.
 
+`--trajectory` also works on its own, and takes a reference file as readily as an OKVIS CSV,
+so a dataset can be viewed moving through the world before any SLAM output exists:
+
+```bash
+python3 ./viz.py <dataset_path> --trajectory <groundtruth.txt> --config <okvis2.yaml>
+```
+
 The viewer is spawned automatically. Over SSH use `--serve`, or write a file and open it
 locally:
 
@@ -50,6 +57,7 @@ frame and the viewer does the placing — no point cloud or mesh is transformed 
 /world                        static ViewCoordinates (z up)
 /world/axes                   static Arrows3D           -> world frame triad
 /world/trajectory             static LineStrips3D       -> the whole estimated path
+/world/groundtruth            static LineStrips3D       -> reference path, aligned (green)
 /world/mesh/<name>            static Mesh3D             -> vertices already in world frame
 /world/imu                    Transform3D per pose      -> T_WS from the trajectory
 /world/imu/body               static Transform3D        -> T_SB, i.e. inverse of T_BS
@@ -88,6 +96,19 @@ cloud.
 A `lidar*` folder whose CSV has fewer than six columns is not a point cloud and is skipped
 with a warning
 
+## Ground truth alignment
+
+`--groundtruth` takes a space-separated reference file (`timestamp tx ty tz ...`, timestamps
+in **seconds**, header optionally `#`-commented) and draws it in green next to the amber
+estimate.
+
+The two do not share a frame, so they are aligned as follows:
+nearest-timestamp association subsampling the longer stream, then a position-only rigid
+Umeyama/Horn fit with no scale. The resulting transform is applied **inverted** — moving the
+reference onto the estimate rather than the other way round — so the estimated poses, the
+meshes and the lidar stay exactly where they were logged and only the reference line moves.
+The fit is identical either way.
+
 ## Colours are fixed and absolute
 
 A given value always produces the same colour — across scans and across datasets. Nothing
@@ -110,6 +131,7 @@ monotonic normalisation over their whole domain rather than a linear window with
 | `--results DIR` | result directory with `*_trajectory.csv` and `mesh_*.ply` |
 | `--config FILE` | OKVIS config supplying `T_SC`, `T_SL`, `T_BS` |
 | `--trajectory FILE` | explicit trajectory, instead of the one picked from `--results` |
+| `--groundtruth FILE` | reference trajectory, rigidly aligned before plotting |
 | `--lidar-frequency HZ` | scan interval is 1/HZ (default `10`) |
 | `--max-scans N` | stop after N scans (default: whole file) |
 | `--lidar-color` | `intensity` (default), `ring`, `z`, `range`, `none` |

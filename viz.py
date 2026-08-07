@@ -56,7 +56,8 @@ WORLD_AXIS_LENGTH = 0.5
 IMAGE_PLANE_DISTANCE = 1.0
 
 TRAJECTORY_COLOR = (255, 190, 60)
-TRAJECTORY_RADIUS = 0.02
+GROUNDTRUTH_COLOR = (80, 220, 120)
+TRAJECTORY_RADIUS = 0.1
 
 LIDAR_COLOR_MODES = ("intensity", "ring", "z", "range", "none")
 
@@ -98,7 +99,13 @@ def parse_args() -> argparse.Namespace:
     )
     overlay.add_argument(
         "--trajectory", type=Path, default=None, metavar="FILE",
-        help="explicit trajectory CSV, instead of the one picked from --results",
+        help="trajectory to move the sensors along, instead of the one picked from "
+             "--results; accepts an OKVIS CSV or a reference file, and works on its own",
+    )
+    overlay.add_argument(
+        "--groundtruth", type=Path, default=None, metavar="FILE",
+        help="reference trajectory (space separated, timestamps in seconds); rigidly "
+             "aligned to the estimate before plotting",
     )
 
     streams = parser.add_argument_group("streams")
@@ -246,6 +253,19 @@ def log_trajectory(trajectory: results.Trajectory) -> None:
         log_pose(int(timestamp_ns), position, quaternion)
 
 
+def log_ground_truth(positions: np.ndarray) -> None:
+    """Log the reference trajectory, already carried into the estimate's world frame."""
+    rr.log(
+        bp.GROUNDTRUTH,
+        rr.LineStrips3D(
+            [positions.astype(np.float32)],
+            colors=[GROUNDTRUTH_COLOR],
+            radii=[TRAJECTORY_RADIUS],
+        ),
+        static=True,
+    )
+
+
 def log_meshes(paths: list[Path]) -> tuple[int, int]:
     """Log every submap mesh as static geometry. Returns ``(meshes, vertices)``.
 
@@ -341,7 +361,9 @@ def log_scan(scan: euroc.LidarScan, mode: str, rings: int) -> None:
 # ----------------------------------------------------------------------------------
 
 
-def load_results(args: argparse.Namespace) -> tuple[results.Trajectory | None, list[Path]]:
+def load_results(
+    args: argparse.Namespace,
+) -> tuple[results.Trajectory | None, Path | None, list[Path]]:
     """Resolve the trajectory and mesh list from ``--results`` / ``--trajectory``."""
     trajectory_path = args.trajectory
     meshes: list[Path] = []
@@ -356,13 +378,10 @@ def load_results(args: argparse.Namespace) -> tuple[results.Trajectory | None, l
         if not args.no_meshes:
             meshes = results.find_meshes(args.results)
 
-    trajectory = None
-    if trajectory_path is not None:
-        trajectory = results.read_trajectory(trajectory_path)
-        print(f"  results  {trajectory_path.name}: {len(trajectory)} poses")
-    if meshes:
-        print(f"           {len(meshes)} mesh files")
-    return trajectory, meshes
+    trajectory = (
+        results.read_trajectory(trajectory_path) if trajectory_path is not None else None
+    )
+    return trajectory, trajectory_path, meshes
 
 
 def main() -> int:
@@ -413,6 +432,21 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    # ---- results and calibration ----------------------------------------------------
+    # Loaded before the timeline is worked out, because a trajectory carries timestamps of
+    # its own and may be the only time-varying thing present.
+    try:
+        trajectory, trajectory_path, mesh_paths = load_results(args)
+        calibration = calib.load(args.config) if args.config is not None else None
+        ground_truth = (
+            results.read_ground_truth(args.groundtruth)
+            if args.groundtruth is not None
+            else None
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     # ---- report the timeline extent before logging anything -------------------------
     spans: list[tuple[int, int]] = []
     for index in images.values():
@@ -426,18 +460,29 @@ def main() -> int:
         except (OSError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+    if trajectory is not None and len(trajectory):
+        spans.append((int(trajectory.timestamps_ns[0]), int(trajectory.timestamps_ns[-1])))
 
-    if not spans:
-        print("error: every selected stream is empty", file=sys.stderr)
+    # Meshes and the reference trajectory are static, so they are worth showing even with no
+    # time-varying stream at all.
+    has_static = bool(mesh_paths) or ground_truth is not None
+    if not spans and not has_static:
+        print("error: nothing selected to visualise", file=sys.stderr)
         return 2
 
-    start_ns = min(span[0] for span in spans)
-    end_ns = max(span[1] for span in spans)
-    print(
-        f"{dataset.root}\n"
-        f"  timeline {start_ns / euroc.NS_PER_S:.3f} .. {end_ns / euroc.NS_PER_S:.3f} s "
-        f"({(end_ns - start_ns) / euroc.NS_PER_S:.1f} s)"
-    )
+    print(f"{dataset.root}")
+    if spans:
+        start_ns = min(span[0] for span in spans)
+        end_ns = max(span[1] for span in spans)
+        print(
+            f"  timeline {start_ns / euroc.NS_PER_S:.3f} .. "
+            f"{end_ns / euroc.NS_PER_S:.3f} s "
+            f"({(end_ns - start_ns) / euroc.NS_PER_S:.1f} s)"
+        )
+    if trajectory is not None:
+        print(f"  traj     {trajectory_path.name}: {len(trajectory)} poses")
+    if mesh_paths:
+        print(f"           {len(mesh_paths)} mesh files")
     if lidar_reader is not None:
         size = lidar_reader.path.stat().st_size
         print(
@@ -450,14 +495,6 @@ def main() -> int:
                 f"({size / 1e9:.0f} GB); pass --max-scans N to stop early",
                 file=sys.stderr,
             )
-
-    # ---- results and calibration ----------------------------------------------------
-    try:
-        trajectory, mesh_paths = load_results(args)
-        calibration = calib.load(args.config) if args.config is not None else None
-    except (OSError, ValueError, KeyError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
 
     if calibration is not None:
         print(
@@ -483,7 +520,12 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    with_world = trajectory is not None or calibration is not None or bool(mesh_paths)
+    with_world = (
+        trajectory is not None
+        or calibration is not None
+        or bool(mesh_paths)
+        or ground_truth is not None
+    )
 
     # ---- connect to Rerun ----------------------------------------------------------
     layout = bp.build(
@@ -518,6 +560,23 @@ def main() -> int:
 
     if trajectory is not None:
         log_trajectory(trajectory)
+
+    if ground_truth is not None:
+        if trajectory is not None:
+            gt_positions, rmse = results.align_ground_truth(trajectory, ground_truth)
+            print(
+                f"  gt       {args.groundtruth.name}: {len(ground_truth)} poses, "
+                f"aligned to the estimate (ATE RMSE {rmse:.3f} m)"
+            )
+        else:
+            gt_positions = ground_truth.positions
+            print(f"  gt       {args.groundtruth.name}: {len(ground_truth)} poses")
+            print(
+                "warning: no estimated trajectory to align against, so the reference is "
+                "drawn in its own frame",
+                file=sys.stderr,
+            )
+        log_ground_truth(gt_positions)
 
     if mesh_paths:
         count, vertices = log_meshes(mesh_paths)

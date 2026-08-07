@@ -45,6 +45,7 @@ TIMELINE = "sensor_time"
 
 WORLD = "/world"
 TRAJECTORY = f"{WORLD}/trajectory"
+GROUNDTRUTH = f"{WORLD}/groundtruth"
 MESHES = f"{WORLD}/mesh"
 IMU = f"{WORLD}/imu"
 BODY = f"{IMU}/body"

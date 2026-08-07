@@ -17,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 
+NS_PER_S = 1_000_000_000
+
 
 def _natural_key(name: str) -> tuple:
     return tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name))
@@ -63,25 +65,70 @@ class Trajectory:
         return len(self.timestamps_ns)
 
 
+def _is_comma_separated(path: Path) -> bool:
+    """Tell the OKVIS CSV apart from the space-separated reference format.
+
+    The OKVIS CSV has commas in its header and in every row; reference files have none.
+    """
+    with path.open("rb") as handle:
+        for line in handle:
+            if line.strip():
+                return b"," in line
+    return False
+
+
+def _load_reference_rows(path: Path) -> np.ndarray:
+    """Rows of a space-separated reference file.
+
+    Both header conventions are in use -- ``#``-commented and bare -- so an uncommented
+    header line is skipped on a retry.
+    """
+    try:
+        return np.loadtxt(path, comments="#", ndmin=2)
+    except ValueError:
+        return np.loadtxt(path, comments="#", skiprows=1, ndmin=2)
+
+
 def read_trajectory(path: str | Path) -> Trajectory:
-    """Read an OKVIS trajectory CSV.
+    """Read a trajectory in either of the two formats in use.
 
-    Only the first eight columns are read -- ``timestamp``, ``p_WS_W_{xyz}`` and
-    ``q_WS_{xyzw}``. That is deliberate rather than lazy: the rows carry a trailing comma,
-    so a full-width parse sees one more field than the header names, and the ``-final``
-    variants append an extra unnamed ``keyframeId`` column on top of that. Reading a fixed
-    prefix by position sidesteps both quirks.
+    Both are accepted so a *reference* trajectory can drive the scene exactly as an
+    estimated one does, which is what makes the dataset viewable in a world frame before
+    any SLAM output exists.
 
-    Note the quaternion is stored **xyzw** (w last), which is also what Rerun expects.
+    * **OKVIS CSV** -- comma separated, one header line, timestamps in nanoseconds. Only
+      the first eight columns are read (``timestamp``, ``p_WS_W_{xyz}``, ``q_WS_{xyzw}``),
+      which is deliberate rather than lazy: the rows carry a trailing comma, so a
+      full-width parse sees one more field than the header names, and the ``-final``
+      variants append an unnamed ``keyframeId`` column on top of that.
+    * **Reference** -- space separated, timestamps in seconds. The quaternion columns are
+      required here, because orientation is what lets the sensors be placed; a
+      position-only file can still be drawn as a line via :func:`read_ground_truth`.
+
+    Either way the quaternion is **xyzw** (w last), which is also what Rerun expects.
     """
     path = Path(path)
-    raw = np.loadtxt(path, delimiter=",", skiprows=1, usecols=range(8), dtype=np.float64,
-                     ndmin=2)
-    if len(raw) == 0:
-        raise ValueError(f"{path}: no pose rows")
+    comma = _is_comma_separated(path)
+    if comma:
+        raw = np.loadtxt(path, delimiter=",", skiprows=1, usecols=range(8),
+                         dtype=np.float64, ndmin=2)
+    else:
+        raw = _load_reference_rows(path)
 
-    # The realtime file repeats its final state; keep the first of any duplicate.
-    timestamps = raw[:, 0].astype(np.int64)
+    if raw.size == 0:
+        raise ValueError(f"{path}: no pose rows")
+    if not comma and raw.shape[1] < 8:
+        raise ValueError(
+            f"{path}: needs 8 columns (timestamp, position, xyzw quaternion) to place the "
+            f"sensors, got {raw.shape[1]}"
+        )
+
+    # The realtime OKVIS file repeats its final state; keep the first of any duplicate.
+    timestamps = (
+        raw[:, 0].astype(np.int64)  # already nanoseconds
+        if comma
+        else np.rint(raw[:, 0] * NS_PER_S).astype(np.int64)  # seconds -> nanoseconds
+    )
     order = np.argsort(timestamps, kind="stable")
     raw, timestamps = raw[order], timestamps[order]
     unique = np.concatenate(([True], np.diff(timestamps) != 0))
@@ -215,3 +262,111 @@ def read_mesh_ply(path: str | Path) -> Mesh:
         )
 
     return Mesh(name=path.stem, vertices=vertices, triangles=triangles)
+
+
+# ----------------------------------------------------------------------------------
+# Ground truth and frame alignment
+# ----------------------------------------------------------------------------------
+
+
+@dataclass
+class GroundTruth:
+    """Reference positions, expressed in their own world frame."""
+
+    timestamps_ns: np.ndarray  # (N,) int64
+    positions: np.ndarray  # (N, 3)
+
+    def __len__(self) -> int:
+        return len(self.timestamps_ns)
+
+
+def read_ground_truth(path: str | Path) -> GroundTruth:
+    """Read a space-separated reference file: ``timestamp tx ty tz [qx qy qz qw ...]``.
+
+    The timestamps are in **seconds** here, unlike the nanoseconds used by the sensor and
+    trajectory CSVs, and are converted on read. Only the position columns are kept, since
+    the alignment below is position-only -- so unlike :func:`read_trajectory`, a file
+    without orientation is fine.
+    """
+    path = Path(path)
+    raw = _load_reference_rows(path)
+    if raw.shape[1] < 4:
+        raise ValueError(f"{path}: expected at least 4 columns, got {raw.shape[1]}")
+
+    timestamps_ns = np.rint(raw[:, 0] * NS_PER_S).astype(np.int64)
+    order = np.argsort(timestamps_ns, kind="stable")
+    return GroundTruth(timestamps_ns=timestamps_ns[order], positions=raw[order, 1:4])
+
+
+def _nearest_index(pool: np.ndarray, query: np.ndarray) -> np.ndarray:
+    """Index of the nearest ``pool`` entry for each ``query`` value."""
+    order = np.argsort(pool)
+    sorted_pool = pool[order]
+    position = np.clip(np.searchsorted(sorted_pool, query), 1, len(sorted_pool) - 1)
+    left, right = sorted_pool[position - 1], sorted_pool[position]
+    return order[np.where((query - left) <= (right - query), position - 1, position)]
+
+
+def associate_nearest(
+    t_e: np.ndarray, p_e: np.ndarray, t_g: np.ndarray, p_g: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pair estimate and reference positions by nearest timestamp.
+
+    The longer stream is subsampled, so both sides come back index-aligned and of equal
+    length (that of the shorter stream).
+    """
+    if len(t_e) > len(t_g):
+        return p_e[_nearest_index(t_e, t_g)], p_g
+    return p_e, p_g[_nearest_index(t_g, t_e)]
+
+
+def align_position_only(
+    p_e: np.ndarray, p_g: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rigid, no-scale Umeyama/Horn fit mapping the estimate onto the reference.
+
+    Position-only: orientations are not used. Returns ``(p_e_aligned, T_ge)``.
+    """
+    e_centroid, g_centroid = p_e.mean(axis=0), p_g.mean(axis=0)
+    H = (p_e - e_centroid).T @ (p_g - g_centroid)  # 3x3 cross-covariance
+
+    U, _, Vt = np.linalg.svd(H)
+    V = Vt.T
+    R_ge = V @ U.T
+    if np.linalg.det(R_ge) < 0.0:  # reflection fix
+        V[:, 2] = -V[:, 2]
+        R_ge = V @ U.T
+    t_ge = g_centroid - R_ge @ e_centroid
+
+    T_ge = np.eye(4)
+    T_ge[:3, :3] = R_ge
+    T_ge[:3, 3] = t_ge
+    return (R_ge @ p_e.T).T + t_ge, T_ge
+
+
+def align_ground_truth(
+    trajectory: Trajectory, ground_truth: GroundTruth
+) -> tuple[np.ndarray, float]:
+    """Express the reference trajectory in the estimate's world frame.
+
+    The alignment is computed the way the evaluation tooling does it -- nearest-timestamp
+    association, then a position-only rigid fit of the estimate onto the reference -- but
+    the resulting transform is applied the other way round, moving the reference onto the
+    estimate rather than the estimate onto the reference. The fit is the same either way;
+    inverting it just means the estimated poses, the meshes and the lidar stay exactly
+    where they were logged and only the reference line moves.
+
+    Returns ``(positions_in_estimate_frame, ate_rmse)``.
+    """
+    p_e, p_g = associate_nearest(
+        trajectory.timestamps_ns.astype(np.float64),
+        trajectory.positions,
+        ground_truth.timestamps_ns.astype(np.float64),
+        ground_truth.positions,
+    )
+    p_e_aligned, T_ge = align_position_only(p_e, p_g)
+    rmse = float(np.sqrt(np.mean(np.sum((p_e_aligned - p_g) ** 2, axis=1))))
+
+    R_eg = T_ge[:3, :3].T  # rigid inverse
+    t_eg = -R_eg @ T_ge[:3, 3]
+    return (R_eg @ ground_truth.positions.T).T + t_eg, rmse
