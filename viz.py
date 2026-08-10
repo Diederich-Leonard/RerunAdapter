@@ -788,7 +788,7 @@ def main() -> int:
         with_imu=imu is not None and len(imu) > 0,
         with_world=with_world,
     )
-    rr.script_setup(args, "euroc_viz", default_blueprint=layout)
+    rr.script_setup(args, "okvis_viz", recording_id="okvis", default_blueprint=layout)
     # Force the layout active rather than relying on default_blueprint alone. The viewer
     # caches a blueprint per application id, and that cache wins over a default -- so a
     # layout remembered from a dataset with different streams would otherwise shadow this
