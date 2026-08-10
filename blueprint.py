@@ -13,7 +13,7 @@ trajectory gives the IMU's pose in the world, the IMU frame S is the natural mov
     /world/imu/axes               static Arrows3D
     /world/imu/body               static Transform3D: T_SB, i.e. inverse of the config T_BS
     /world/imu/<stream>           static Transform3D: T_SC for that camera
-    /world/imu/<stream>/image     static Pinhole + EncodedImage per frame
+    /world/imu/<stream>/image     static Pinhole + Image (undistorted) or EncodedImage per frame
     /world/imu/lidar0             static Transform3D: T_SL
     /world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
     /plots/imu/accel/{x,y,z}      whole series, sent columnar

@@ -68,7 +68,7 @@ frame and the viewer does the placing — no point cloud or mesh is transformed 
 /world/imu                    Transform3D per pose      -> T_WS from the trajectory
 /world/imu/body               static Transform3D        -> T_SB, i.e. inverse of T_BS
 /world/imu/<stream>           static Transform3D        -> T_SC for that camera
-/world/imu/<stream>/image     static Pinhole + EncodedImage per frame
+/world/imu/<stream>/image     static Pinhole + Image (undistorted, with --undistort) or EncodedImage per frame
 /world/imu/lidar0             static Transform3D        -> T_SL
 /world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
 /plots/imu/accel/{x,y,z}      scalar series, columnar   -> view "acceleration [m/s^2]"
@@ -101,6 +101,21 @@ cloud.
 
 A `lidar*` folder whose CSV has fewer than six columns is not a point cloud and is skipped
 with a warning
+
+## Undistortion
+
+With `--undistort`, a camera the config gives `distortion_type: equidistant` and non-zero
+`distortion_coefficients` for (the Kannala-Brandt / OpenCV fisheye model) has its images
+decoded, resampled onto its own `K` and logged as a plain image, so the 2D view lines up with
+the frustum and any other pinhole overlay drawn from the same intrinsics. This needs
+`--config`, but not `--results`, so it works whether or not a SLAM run is being overlaid:
+
+```bash
+python3 ./viz.py <dataset_path> --config <okvis2.yaml> --undistort
+```
+
+Without `--undistort`, or for any other `distortion_type` (`radialtangential`, `none`, ...),
+frames are left as the still-distorted encoded bytes, same as without `--config` at all.
 
 ## Ground truth alignment
 
@@ -139,6 +154,7 @@ monotonic normalisation over their whole domain rather than a linear window with
 | `--config FILE` | OKVIS config supplying `T_SC`, `T_SL`, `T_BS` |
 | `--trajectory FILE` | explicit trajectory, instead of the one picked from `--results` |
 | `--groundtruth FILE` | reference trajectory, rigidly aligned before plotting |
+| `--undistort` | undistort images from an `equidistant` `--config` camera (default: leave encoded) |
 | `--lidar-frequency HZ` | scan interval is 1/HZ (default `10`) |
 | `--start SEC` | skip this many seconds of sensor data (default `0`) |
 | `--duration SEC` | seconds of sensor data to load (default: all) |
@@ -153,6 +169,7 @@ viz.py         CLI, the logging loop, and the only Rerun logging calls
 euroc.py       stream discovery + readers (images, IMU, streaming lidar) — no Rerun
 results.py     trajectory and submap mesh readers, pose interpolation — no Rerun
 calib.py       OKVIS config -> intrinsics and T_SC / T_SL / T_BS — no Rerun
+undistort.py   the equidistant (fisheye) camera model: backward map (numpy) + resample (cv2)
 blueprint.py   entity paths and the default view layout
 colormap.py    turbo table and the fixed value->colour mappings
 ```
@@ -168,7 +185,9 @@ colormap.py    turbo table and the fixed value->colour mappings
 
 Any folder containing both a `data.csv` and a `data/` subfolder is treated as an image
 stream, whatever it is named. Grayscale and colour are handled identically because the
-encoded bytes are passed through untouched and the viewer decodes them.
+encoded bytes are passed through untouched and the viewer decodes them -- except that, with
+`--undistort`, a stream `--config` pairs with an `equidistant` camera is decoded and
+undistorted before logging instead; see [Undistortion](#undistortion).
 
 ## Known limitations
 
@@ -178,9 +197,10 @@ encoded bytes are passed through untouched and the viewer decodes them.
 - **Camera frusta follow the discovered image streams**, paired with the config's cameras in
   order, so `--no-images` also removes them. A config with a different camera count than the
   dataset has streams pairs the first *n* and warns.
-- **`rr.Pinhole` carries no distortion model.** The frusta and any 2D overlay assume a plain
-  pinhole while the logged pixels are still distorted, which these configs are
-  (`distortion_type: equidistant`).
+- **Undistortion only understands the equidistant (Kannala-Brandt) model.** A
+  `radialtangential` camera, or any other model, is logged as still-distorted encoded bytes,
+  the same as a plain `rr.Pinhole` always was -- the frustum and 2D overlay assume a plain
+  pinhole, which is only actually true once undistortion has run.
 - **A config without `lidar.T_SL` leaves the lidar at the IMU frame** and warns; not every
   OKVIS config has that section.
 - **No motion compensation within a scan**, and the whole scan is logged at the start of

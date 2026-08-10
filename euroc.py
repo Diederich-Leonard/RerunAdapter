@@ -1,7 +1,8 @@
 """Readers for datasets in the EuRoC/ASL directory layout.
 
-Pure stdlib + numpy: nothing here imports Rerun, so the readers can be tested and reused
-on their own.
+Pure stdlib + numpy, plus Pillow for the one function that decodes image bytes
+(:func:`read_image`, needed only for on-the-fly undistortion): nothing here imports Rerun,
+so the readers can be tested and reused on their own.
 
 Expected layout -- stream folders directly under the dataset root::
 
@@ -33,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 NS_PER_S = 1_000_000_000
 
@@ -171,6 +173,18 @@ def read_image_index(stream_dir: str | Path) -> ImageIndex:
         paths=paths,
         missing=missing,
     )
+
+
+def read_image(path: str | Path) -> np.ndarray:
+    """Decode one image file into ``(H, W)`` greyscale or ``(H, W, 3)`` RGB.
+
+    Only needed for on-the-fly processing (currently: undistortion) -- the normal logging
+    path streams the encoded bytes straight to the viewer and never decodes anything.
+    """
+    with Image.open(path) as handle:
+        if handle.mode != "L":
+            handle = handle.convert("RGB")
+        return np.asarray(handle)
 
 
 # ----------------------------------------------------------------------------------

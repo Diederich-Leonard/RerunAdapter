@@ -41,6 +41,7 @@ import calib
 import colormap
 import euroc
 import results
+import undistort
 
 #: Point size in UI points. Rerun reads a negative radius as a screen-space size, which
 #: keeps a sparse cloud visible whether you are 1 m or 100 m from it.
@@ -123,6 +124,11 @@ def parse_args() -> argparse.Namespace:
         "--groundtruth", type=Path, default=None, metavar="FILE",
         help="reference trajectory (space separated, timestamps in seconds); rigidly "
              "aligned to the estimate before plotting",
+    )
+    overlay.add_argument(
+        "--undistort", action="store_true",
+        help="undistort images from a --config camera with distortion_type: equidistant "
+             "(default: log the encoded bytes as-is)",
     )
 
     streams = parser.add_argument_group("streams")
@@ -347,6 +353,28 @@ def log_imu(imu: euroc.ImuData) -> None:
             )
 
 
+def log_image(
+    name: str, path: Path, undistort_map: tuple[np.ndarray, np.ndarray] | None
+) -> bool:
+    """Log one frame, undistorting it first if ``undistort_map`` applies to this stream.
+
+    Undistorting means decoding, resampling and re-encoding, so it is only done for a
+    stream that actually needs it; every other frame keeps streaming as encoded bytes the
+    viewer decodes itself. Returns whether the frame came out undistorted, which is ``False``
+    both when there is no map for this stream and when the on-disk image no longer matches
+    the map's resolution -- the caller distinguishes those by whether it passed a map in.
+    """
+    if undistort_map is not None:
+        map_x, map_y = undistort_map
+        image = euroc.read_image(path)
+        if image.shape[:2] == map_x.shape:
+            undistorted = undistort.remap(image, map_x, map_y)
+            rr.log(bp.image_entity(name), rr.Image(undistorted).compress())
+            return True
+    rr.log(bp.image_entity(name), rr.EncodedImage(path=path))
+    return False
+
+
 def scan_colors(scan: euroc.LidarScan, mode: str, rings: int) -> np.ndarray | None:
     """Per-point colours for one scan, or ``None`` for uniform white.
 
@@ -408,6 +436,25 @@ def load_results(
     )
     return trajectory, trajectory_path, meshes
 
+def load_undistort_maps(
+    calibration: calib.Calibration | None, streams: list[str]
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Backward-mapping grids for streams paired with an equidistant camera in the config.
+
+    Cameras are paired with image streams in order, same as :func:`load_camera_poses`. A
+    camera using a different distortion model, or one with all-zero coefficients, has
+    nothing to undo and is left out, so its frames keep streaming as encoded bytes untouched.
+    """
+    if calibration is None:
+        return {}
+    maps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name, camera in zip(streams, calibration.cameras):
+        if camera.distortion_type == "equidistant" and np.any(camera.distortion):
+            maps[name] = undistort.equidistant_map(
+                camera.K, camera.distortion, camera.resolution
+            )
+    return maps
+
 
 def main() -> int:
     args = parse_args()
@@ -463,6 +510,9 @@ def main() -> int:
     try:
         trajectory, trajectory_path, mesh_paths = load_results(args)
         calibration = calib.load(args.config) if args.config is not None else None
+        undistort_maps = (
+            load_undistort_maps(calibration, list(images)) if args.undistort else {}
+        )
         ground_truth = (
             results.read_ground_truth(args.groundtruth)
             if args.groundtruth is not None
@@ -589,6 +639,8 @@ def main() -> int:
                 "with the IMU frame in the world view",
                 file=sys.stderr,
             )
+        if undistort_maps:
+            print(f"           undistorting (equidistant): {', '.join(undistort_maps)}")
     if trajectory is None and (calibration is not None or mesh_paths):
         print(
             "warning: no trajectory, so the rig stays at the world origin",
@@ -667,12 +719,21 @@ def main() -> int:
 
     # ---- image streams -------------------------------------------------------------
     for name, index in images.items():
+        umap = undistort_maps.get(name)
+        mismatched = False
         for timestamp_ns, path in zip(index.timestamps_ns, index.paths, strict=True):
             place(int(timestamp_ns))
             set_time(int(timestamp_ns))
-            rr.log(bp.image_entity(name), rr.EncodedImage(path=path))
+            if not log_image(name, path, umap) and umap is not None and not mismatched:
+                print(
+                    f"warning: {name} image is not {umap[0].shape[1]}x{umap[0].shape[0]} "
+                    f"as the config expects; leaving it distorted",
+                    file=sys.stderr,
+                )
+                mismatched = True
         note = f"   ({index.missing} image files missing)" if index.missing else ""
-        print(f"  {name:<8} {len(index):>7} frames{note}")
+        undistorted_note = "   (undistorted)" if umap is not None and not mismatched else ""
+        print(f"  {name:<8} {len(index):>7} frames{note}{undistorted_note}")
 
     # ---- lidar ---------------------------------------------------------------------
     if lidar_reader is not None:
