@@ -134,18 +134,38 @@ python3 ./viz.py <dataset_path> --config <okvis2.yaml> \
 The left-hand side names the image stream to move, so the flag can be repeated to move
 several cameras independently, and only cameras the config actually pairs with a stream can
 be named. `--config` is required — its intrinsics are still what the pinhole is drawn from,
-even though its `T_SC` for that camera is no longer used.
+and for a JSON pose file its `T_SC` for that camera is also used, as described below.
 
-Each row is `timestamp tx ty tz qx qy qz qw`, comma- or space-separated, `#`-commented
-header optional. **Timestamps are nanoseconds** on the dataset clock, like the sensor and
-trajectory CSVs rather than the seconds a `--groundtruth` file uses; a stream that overlaps
-nothing else is reported as a warning, since that is what a unit mix-up looks like.
+FILE can be either of two formats:
 
-The pose is read as the camera's placement **in the world frame**, i.e. `T_WC` directly —
-not composed with the trajectory. It is logged on a world-rooted entity, `/world/<stream>`,
-instead of the static camera's usual `/world/imu/<stream>`, so it isn't also carried by the
-IMU's `T_WS`. The pinhole, the frustum, the images and the coordinate triad all hang off
-that entity, so they follow the moving camera without anything else changing.
+- **CSV**: each row is `timestamp tx ty tz qx qy qz qw`, comma- or space-separated,
+  `#`-commented header optional. **Timestamps are nanoseconds** on the dataset clock, like
+  the sensor and trajectory CSVs rather than the seconds a `--groundtruth` file uses. Poses
+  are read as `T_WC` directly, already in the world frame.
+- **JSON** (`.json` extension): a list of `{"frame_id", "filename", "pose": {"timestamp":
+  seconds, "pose": {"rotation": [x, y, z, w], "translation": [x, y, z]}}}` entries, as
+  written by gastonpy's camera pose export. `timestamp` is **seconds** here and is converted
+  to nanoseconds on read; `frame_id`/`filename` are ignored. Unlike the CSV format, these
+  poses are **not** assumed to already be in the world frame — see below.
+
+Either way, a stream that overlaps nothing else is reported as a warning, since that is what
+a unit mix-up looks like.
+
+A CSV pose file is read as the camera's placement **in the world frame**, i.e. `T_WC`
+directly. A JSON pose file, by contrast, is typically produced by its own algorithm's own
+arbitrary frame, unrelated to the SLAM run's world frame — so it is **rigidly rebased** onto
+the world frame before use: since the estimated IMU trajectory always starts at the world
+origin with no rotation, the camera's true world pose at the pose file's first timestamp is
+exactly the config's static `T_SC` for that camera, and the whole stream is shifted (rotated
+and translated as one rigid body, preserving all of its relative motion) so its first pose
+lands there instead of wherever its own producer's frame happened to put it. This is what
+lets a JSON pose file be used without ever needing the matching world-frame trajectory CSV.
+
+Either way, once resolved to `T_WC`, the pose is logged on a world-rooted entity,
+`/world/<stream>`, instead of the static camera's usual `/world/imu/<stream>`, so it isn't
+also carried by the IMU's `T_WS`. The pinhole, the frustum, the images and the coordinate
+triad all hang off that entity, so they follow the moving camera without anything else
+changing.
 
 Like the trajectory, a pose file is loaded whole regardless of `--start` / `--duration`, and
 its first pose is held from the beginning of the timeline so the camera never falls back to
@@ -187,7 +207,7 @@ monotonic normalisation over their whole domain rather than a linear window with
 | `--mesh-regex REGEX` | filename a mesh must fully match (default `mesh_.*\.ply`) |
 | `--config FILE` | OKVIS config supplying `T_SC`, `T_SL`, `T_BS` |
 | `--trajectory FILE` | explicit trajectory, instead of the one picked from `--results` |
-| `--camera-pose STREAM=FILE` | move one camera over time, placing it directly in the world frame (`T_WC`) instead of via its config `T_SC`; repeatable |
+| `--camera-pose STREAM=FILE` | move one camera over time, placing it directly in the world frame (`T_WC`) instead of via its config `T_SC`; FILE is a CSV or a frame/pose JSON list; repeatable |
 | `--groundtruth FILE` | reference trajectory, rigidly aligned before plotting |
 | `--undistort` | undistort images from an `equidistant` `--config` camera (default: leave encoded) |
 | `--lidar-frequency HZ` | scan interval is 1/HZ (default `10`) |

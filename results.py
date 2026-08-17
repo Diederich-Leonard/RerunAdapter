@@ -1,6 +1,6 @@
 """Readers for a SLAM result directory: estimated trajectory and submap meshes.
 
-Pure stdlib + numpy: nothing here imports Rerun.
+Stdlib + numpy + scipy (for SE3 composition): nothing here imports Rerun.
 
 A result directory is expected to hold
 
@@ -8,17 +8,20 @@ A result directory is expected to hold
 * any number of ``mesh_*.ply`` -- submap meshes whose vertices are already in the world
   frame, so they need no transform to be placed.
 
-:func:`read_pose_stream` reads the same kind of pose rows without attaching any frame
-meaning to them, which is how a moving camera's own pose file is loaded.
+:func:`read_pose_stream` reads a moving camera's own pose file, in either of two formats --
+CSV rows already in the world frame, or a frame/pose JSON list rebased onto it (see
+:func:`_rebase_to_anchor`).
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 NS_PER_S = 1_000_000_000
 
@@ -246,7 +249,8 @@ class PoseStream:
 
     What the poses *mean* is decided by whoever composes them -- unlike :class:`Trajectory`,
     which is specifically the IMU in the world. This is what a moving camera's own pose file
-    is read into: there each pose is ``T_WC``, the camera's pose already in the world frame.
+    is read into: there each pose is ``T_WC``, the camera's pose in the world frame -- either
+    natively (a CSV file) or rebased onto it (a JSON file; see :func:`read_pose_stream`).
     """
 
     name: str
@@ -258,15 +262,13 @@ class PoseStream:
         return len(self.timestamps_ns)
 
 
-def read_pose_stream(path: str | Path) -> PoseStream:
-    """Read ``timestamp tx ty tz qx qy qz qw`` rows, comma- or whitespace-separated.
+def _read_pose_rows_csv(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``timestamp tx ty tz qx qy qz qw`` rows, comma- or whitespace-separated.
 
-    Timestamps are **nanoseconds on the dataset clock**, as in the sensor and trajectory
-    CSVs rather than the seconds a reference file uses: a pose stream is only meaningful
-    against the measurements it is being composed with, so it has to share their clock.
-    Only the first eight columns are read, so a trailing comma or extra columns are fine.
+    Timestamps are **nanoseconds on the dataset clock** already, as in the sensor and
+    trajectory CSVs rather than the seconds a reference file uses. Only the first eight
+    columns are read, so a trailing comma or extra columns are fine.
     """
-    path = Path(path)
     delimiter = "," if _is_comma_separated(path) else None
     try:
         raw = _load_rows(path, delimiter=delimiter, usecols=range(8))
@@ -279,9 +281,111 @@ def read_pose_stream(path: str | Path) -> PoseStream:
     if raw.size == 0:
         raise ValueError(f"{path}: no pose rows")
 
+    return raw[:, 0].astype(np.int64), raw[:, 1:4], raw[:, 4:8]
+
+
+def _read_pose_rows_json(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A ``[{"pose": {"timestamp": ..., "pose": {"rotation": ..., "translation": ...}}}]``
+    list, as written by gastonpy's camera pose export.
+
+    Unlike the CSV format, ``timestamp`` here is **seconds** on the dataset clock, so it is
+    converted to nanoseconds the same way a space-separated reference file's is. ``rotation``
+    is already ``xyzw``, and ``translation`` is ``[x, y, z]``; ``frame_id``/``filename`` are
+    ignored. The poses themselves are in whatever frame their own producer used -- not
+    necessarily the OKVIS world frame -- which :func:`read_pose_stream` corrects for by
+    rebasing onto an anchor pose.
+    """
+    try:
+        entries = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path}: not valid JSON -- {error}") from None
+
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"{path}: expected a non-empty JSON list of pose entries")
+
+    try:
+        seconds = np.array(
+            [entry["pose"]["timestamp"] for entry in entries], dtype=np.float64
+        )
+        positions = np.array(
+            [entry["pose"]["pose"]["translation"] for entry in entries], dtype=np.float64
+        )
+        quaternions = np.array(
+            [entry["pose"]["pose"]["rotation"] for entry in entries], dtype=np.float64
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{path}: expected each entry to have pose.timestamp, "
+            f"pose.pose.translation (xyz) and pose.pose.rotation (xyzw) -- {error}"
+        ) from None
+
+    if positions.shape[1:] != (3,) or quaternions.shape[1:] != (4,):
+        raise ValueError(
+            f"{path}: expected translation to have 3 components and rotation 4, got "
+            f"{positions.shape[1:]} and {quaternions.shape[1:]}"
+        )
+
+    timestamps_ns = np.rint(seconds * NS_PER_S).astype(np.int64)
+    return timestamps_ns, positions, quaternions
+
+
+def _rebase_to_anchor(
+    anchor: np.ndarray, positions: np.ndarray, quaternions: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rigidly shift a pose sequence so its first pose becomes ``anchor`` (a 4x4 ``T_SC``).
+
+    A JSON pose stream is expressed in its own producer's arbitrary frame -- there is no
+    reason it shares OKVIS's world frame, and in practice it does not. But the estimated IMU
+    trajectory always starts at the world origin with identity rotation (``T_WS(0) = I``),
+    so the camera's true world pose at that same first timestamp is exactly the config's
+    static ``T_SC``, with no need for the world-frame trajectory itself to compute it. Rigidly
+    transforming the whole stream so it starts there -- rather than wherever its own
+    producer's frame happened to put it -- turns it into ``T_WC`` while preserving all of its
+    internal (relative) motion untouched.
+    """
+    anchor_rotation = Rotation.from_matrix(anchor[:3, :3])
+    anchor_translation = anchor[:3, 3]
+
+    first_rotation_inv = Rotation.from_quat(quaternions[0]).inv()
+    correction_rotation = anchor_rotation * first_rotation_inv
+    correction_translation = anchor_translation - correction_rotation.apply(positions[0])
+
+    new_positions = correction_rotation.apply(positions) + correction_translation
+    new_quaternions = (correction_rotation * Rotation.from_quat(quaternions)).as_quat()
+    return new_positions, new_quaternions
+
+
+def read_pose_stream(path: str | Path, *, anchor: np.ndarray | None = None) -> PoseStream:
+    """Read a moving camera's pose file, in either of two formats.
+
+    * **CSV** -- ``timestamp tx ty tz qx qy qz qw`` rows, comma- or whitespace-separated,
+      timestamps already nanoseconds on the dataset clock, poses already ``T_WC``.
+    * **JSON** -- a frame/pose list (``.json`` extension), timestamps in seconds (converted
+      to nanoseconds on read), poses rebased onto ``anchor`` -- see :func:`_rebase_to_anchor`
+      -- which for this format is required and should be the camera's config ``T_SC``.
+
+    Either way a pose stream is only meaningful against the measurements it is being
+    composed with, so its timestamps have to end up on the same dataset clock as those.
+    """
+    path = Path(path)
+    is_json = path.suffix.lower() == ".json"
+    if is_json:
+        timestamps_ns, positions, quaternions = _read_pose_rows_json(path)
+    else:
+        timestamps_ns, positions, quaternions = _read_pose_rows_csv(path)
+
     timestamps, positions, quaternions = _clean_poses(
-        path, raw[:, 0].astype(np.int64), raw[:, 1:4], raw[:, 4:8]
+        path, timestamps_ns, positions, quaternions
     )
+
+    if is_json:
+        if anchor is None:
+            raise ValueError(
+                f"{path}: a JSON pose file needs the camera's static T_SC (from --config) "
+                f"to rebase its own frame onto the world frame"
+            )
+        positions, quaternions = _rebase_to_anchor(anchor, positions, quaternions)
+
     return PoseStream(
         name=path.stem,
         timestamps_ns=timestamps,

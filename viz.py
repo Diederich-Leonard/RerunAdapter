@@ -140,9 +140,11 @@ def parse_args() -> argparse.Namespace:
         "--camera-pose", type=camera_pose, action="append", default=[],
         metavar="STREAM=FILE", dest="camera_poses",
         help="move one camera over time: FILE holds that camera's pose in the world frame, "
-             "i.e. T_WC (timestamp, position, xyzw quaternion; nanoseconds), and STREAM "
-             "names the image stream it belongs to, e.g. cam0=cam_pose_estimate.csv. "
-             "Repeat for more than one camera. Needs --config",
+             "i.e. T_WC, as CSV rows (timestamp, position, xyzw quaternion; nanoseconds), "
+             "already in the world frame, or a frame/pose JSON list (timestamp in seconds; "
+             "see results.read_pose_stream), rebased so its first pose matches the config's "
+             "T_SC for that camera, and STREAM names the image stream it belongs to, e.g. "
+             "cam0=cam_pose_estimate.csv. Repeat for more than one camera. Needs --config",
     )
     overlay.add_argument(
         "--groundtruth", type=Path, default=None, metavar="FILE",
@@ -538,7 +540,8 @@ def load_camera_poses(
 
     The names are checked against the cameras that actually exist in this run, so a typo or
     a stream excluded by ``--no-images`` is reported up front rather than silently moving
-    nothing.
+    nothing. Each camera's nominal ``T_SC`` is passed through as the anchor a JSON pose file
+    gets rebased onto (see :func:`results.read_pose_stream`); a CSV file ignores it.
     """
     if not args.camera_poses:
         return {}
@@ -561,7 +564,8 @@ def load_camera_poses(
                 f"--camera-pose names {name!r}, which is not a camera in this run "
                 f"(cameras that can be moved: {known})"
             )
-        loaded[name] = results.read_pose_stream(path)
+        anchor = calibration.cameras[placeable.index(name)].T_SC
+        loaded[name] = results.read_pose_stream(path, anchor=anchor)
     return loaded
 
 
