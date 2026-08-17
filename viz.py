@@ -19,7 +19,8 @@ This is the only module that talks to Rerun's logging API; ``euroc.py`` reads th
 owns the entity paths and the view layout.
 
 A camera that does not sit still can be given its own pose file with ``--camera-pose``,
-which replaces the config's fixed ``T_SC`` for that camera with one that varies over time.
+which places that camera directly in the world frame over time, instead of composing the
+config's fixed ``T_SC`` with the trajectory's ``T_WS``.
 
 Usage:
     python viz.py <dataset_path>
@@ -138,8 +139,8 @@ def parse_args() -> argparse.Namespace:
     overlay.add_argument(
         "--camera-pose", type=camera_pose, action="append", default=[],
         metavar="STREAM=FILE", dest="camera_poses",
-        help="move one camera over time: FILE holds that camera's pose in the IMU frame, "
-             "i.e. T_SC (timestamp, position, xyzw quaternion; nanoseconds), and STREAM "
+        help="move one camera over time: FILE holds that camera's pose in the world frame, "
+             "i.e. T_WC (timestamp, position, xyzw quaternion; nanoseconds), and STREAM "
              "names the image stream it belongs to, e.g. cam0=cam_pose_estimate.csv. "
              "Repeat for more than one camera. Needs --config",
     )
@@ -266,12 +267,13 @@ def log_calibration(
     log_frame_axes(bp.BODY)
 
     for name, camera in zip(streams, calibration.cameras):
-        entity = bp.stream_entity(name)
-        if name not in moving:
+        is_moving = name in moving
+        entity = bp.stream_entity(name, moving=is_moving)
+        if not is_moving:
             log_transform(entity, camera.T_SC)
         log_frame_axes(entity)
         rr.log(
-            bp.image_entity(name),
+            bp.image_entity(name, moving=is_moving),
             rr.Pinhole(
                 image_from_camera=camera.K,
                 resolution=list(camera.resolution),
@@ -295,15 +297,15 @@ def log_camera_poses(
 ) -> None:
     """Stream one camera's extrinsics, straight from its pose file.
 
-    Each row is already ``T_SC``, the camera's placement in the IMU frame -- the same
-    convention the config's static extrinsics use -- so it is logged as-is on the usual
-    :func:`blueprint.stream_entity`, replacing the config's fixed ``T_SC`` for this camera
-    with one that varies over time.
+    Each row is already ``T_WC``, the camera's pose already in the world frame -- so it is
+    logged on a world-rooted entity (:func:`blueprint.stream_entity` with ``moving=True``)
+    rather than under ``/world/imu``: nesting it there would compose ``T_WS * T_WC``, which
+    is wrong now that the file gives a world-frame pose rather than ``T_SC``.
 
     Everything hanging off the camera -- its pinhole, its frustum, its images and its triad
     -- is a child entity, so it all follows from this one transform.
     """
-    entity = bp.stream_entity(name)
+    entity = bp.stream_entity(name, moving=True)
 
     def placed(index: int) -> np.ndarray:
         return calib.rigid(stream.positions[index], stream.quaternions[index])
@@ -420,7 +422,11 @@ def log_imu(imu: euroc.ImuData) -> None:
 
 
 def log_image(
-    name: str, path: Path, undistort_map: tuple[np.ndarray, np.ndarray] | None
+    name: str,
+    path: Path,
+    undistort_map: tuple[np.ndarray, np.ndarray] | None,
+    *,
+    moving: bool = False,
 ) -> bool:
     """Log one frame, undistorting it first if ``undistort_map`` applies to this stream.
 
@@ -430,7 +436,7 @@ def log_image(
     both when there is no map for this stream and when the on-disk image no longer matches
     the map's resolution -- the caller distinguishes those by whether it passed a map in.
     """
-    entity = bp.image_entity(name)
+    entity = bp.image_entity(name, moving=moving)
     if undistort_map is not None:
         map_x, map_y = undistort_map
         image = euroc.read_image(path)
@@ -787,6 +793,7 @@ def main() -> int:
         with_lidar=lidar_reader is not None,
         with_imu=imu is not None and len(imu) > 0,
         with_world=with_world,
+        moving=frozenset(camera_poses),
     )
     rr.script_setup(args, "okvis_viz", recording_id="okvis", default_blueprint=layout)
     # Force the layout active rather than relying on default_blueprint alone. The viewer
@@ -858,7 +865,12 @@ def main() -> int:
         for timestamp_ns, path in zip(index.timestamps_ns, index.paths, strict=True):
             place(int(timestamp_ns))
             set_time(int(timestamp_ns))
-            if not log_image(name, path, umap) and umap is not None and not mismatched:
+            moving = name in camera_poses
+            if (
+                not log_image(name, path, umap, moving=moving)
+                and umap is not None
+                and not mismatched
+            ):
                 print(
                     f"warning: {name} image is not {umap[0].shape[1]}x{umap[0].shape[0]} "
                     f"as the config expects; leaving it distorted",

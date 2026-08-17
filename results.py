@@ -246,7 +246,7 @@ class PoseStream:
 
     What the poses *mean* is decided by whoever composes them -- unlike :class:`Trajectory`,
     which is specifically the IMU in the world. This is what a moving camera's own pose file
-    is read into: there each pose is ``T_SC``, the camera's placement in the IMU frame.
+    is read into: there each pose is ``T_WC``, the camera's pose already in the world frame.
     """
 
     name: str

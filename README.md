@@ -67,9 +67,12 @@ frame and the viewer does the placing — no point cloud or mesh is transformed 
 /world/mesh/<name>            static Mesh3D             -> vertices already in world frame
 /world/imu                    Transform3D per pose      -> T_WS from the trajectory
 /world/imu/body               static Transform3D        -> T_SB, i.e. inverse of T_BS
-/world/imu/<stream>           Transform3D per pose      -> T_SC for that camera (static,
-                              unless the camera is moved with --camera-pose)
-/world/imu/<stream>/image     static Pinhole + Image (undistorted, with --undistort) or EncodedImage per frame
+/world/imu/<stream>           Transform3D per pose      -> T_SC for a static camera (one not
+                              moved with --camera-pose)
+/world/<stream>               Transform3D per pose      -> T_WC for a camera moved with
+                              --camera-pose, rooted directly under /world
+/world/imu/<stream>/image     static Pinhole + Image (undistorted, with --undistort) or EncodedImage per frame, for a static camera
+/world/<stream>/image         same, for a camera moved with --camera-pose
 /world/imu/lidar0             static Transform3D        -> T_SL
 /world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
 /plots/imu/accel/{x,y,z}      scalar series, columnar   -> view "acceleration [m/s^2]"
@@ -130,20 +133,19 @@ python3 ./viz.py <dataset_path> --config <okvis2.yaml> \
 
 The left-hand side names the image stream to move, so the flag can be repeated to move
 several cameras independently, and only cameras the config actually pairs with a stream can
-be named. `--config` is required — its `T_SC` for that camera is what the pose file
-replaces, and its intrinsics are still what the pinhole is drawn from.
+be named. `--config` is required — its intrinsics are still what the pinhole is drawn from,
+even though its `T_SC` for that camera is no longer used.
 
 Each row is `timestamp tx ty tz qx qy qz qw`, comma- or space-separated, `#`-commented
 header optional. **Timestamps are nanoseconds** on the dataset clock, like the sensor and
 trajectory CSVs rather than the seconds a `--groundtruth` file uses; a stream that overlaps
 nothing else is reported as a warning, since that is what a unit mix-up looks like.
 
-The pose is read as the camera's placement **in the IMU frame**, i.e. `T_SC` directly — the
-same convention the config's static extrinsics use, just varying over time instead of fixed.
-It is logged on the camera's usual entity, `/world/imu/<stream>`, simply replacing the
-config's static `T_SC` there with one that changes per timestamp. The pinhole, the frustum,
-the images and the coordinate triad all hang off that entity, so they follow the moving
-camera without anything else changing.
+The pose is read as the camera's placement **in the world frame**, i.e. `T_WC` directly —
+not composed with the trajectory. It is logged on a world-rooted entity, `/world/<stream>`,
+instead of the static camera's usual `/world/imu/<stream>`, so it isn't also carried by the
+IMU's `T_WS`. The pinhole, the frustum, the images and the coordinate triad all hang off
+that entity, so they follow the moving camera without anything else changing.
 
 Like the trajectory, a pose file is loaded whole regardless of `--start` / `--duration`, and
 its first pose is held from the beginning of the timeline so the camera never falls back to
@@ -185,7 +187,7 @@ monotonic normalisation over their whole domain rather than a linear window with
 | `--mesh-regex REGEX` | filename a mesh must fully match (default `mesh_.*\.ply`) |
 | `--config FILE` | OKVIS config supplying `T_SC`, `T_SL`, `T_BS` |
 | `--trajectory FILE` | explicit trajectory, instead of the one picked from `--results` |
-| `--camera-pose STREAM=FILE` | move one camera over time, replacing its nominal `T_SC` with a per-pose one; repeatable |
+| `--camera-pose STREAM=FILE` | move one camera over time, placing it directly in the world frame (`T_WC`) instead of via its config `T_SC`; repeatable |
 | `--groundtruth FILE` | reference trajectory, rigidly aligned before plotting |
 | `--undistort` | undistort images from an `equidistant` `--config` camera (default: leave encoded) |
 | `--lidar-frequency HZ` | scan interval is 1/HZ (default `10`) |

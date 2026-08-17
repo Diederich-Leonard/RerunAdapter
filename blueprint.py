@@ -12,9 +12,12 @@ trajectory gives the IMU's pose in the world, the IMU frame S is the natural mov
     /world/imu                    Transform3D per pose: T_WS, from the trajectory
     /world/imu/axes               static Arrows3D
     /world/imu/body               static Transform3D: T_SB, i.e. inverse of the config T_BS
-    /world/imu/<stream>           Transform3D per pose: T_SC for that camera (static, unless
-                                  the camera is named in --camera-pose)
-    /world/imu/<stream>/image     static Pinhole + Image (undistorted) or EncodedImage per frame
+    /world/imu/<stream>           Transform3D per pose: T_SC for a *static* camera (one not
+                                  named in --camera-pose)
+    /world/<stream>               Transform3D per pose: T_WC for a camera named in
+                                  --camera-pose, rooted directly under /world since its pose
+                                  file already places it in the world frame
+    /world/<stream>/image         static Pinhole + Image (undistorted) or EncodedImage per frame
     /world/imu/lidar0             static Transform3D: T_SL
     /world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
     /plots/imu/accel/{x,y,z}      whole series, sent columnar
@@ -57,14 +60,19 @@ IMU_ACCEL_PLOT = f"{IMU_PLOTS}/accel"
 IMU_GYRO_PLOT = f"{IMU_PLOTS}/gyro"
 
 
-def stream_entity(name: str) -> str:
-    """Entity holding one image stream's frame of reference (its extrinsics land here)."""
-    return f"{IMU}/{name}"
+def stream_entity(name: str, *, moving: bool = False) -> str:
+    """Entity holding one image stream's frame of reference (its extrinsics land here).
+
+    A camera named in ``--camera-pose`` (``moving=True``) roots directly under ``/world``,
+    since its pose file already gives ``T_WC``; a static camera stays under ``/world/imu``,
+    since its config ``T_SC`` still needs to compose with the trajectory's ``T_WS``.
+    """
+    return f"{WORLD}/{name}" if moving else f"{IMU}/{name}"
 
 
-def image_entity(name: str) -> str:
+def image_entity(name: str, *, moving: bool = False) -> str:
     """Entity holding one image stream's pinhole model and images."""
-    return f"{stream_entity(name)}/image"
+    return f"{stream_entity(name, moving=moving)}/image"
 
 
 def axes_entity(frame: str) -> str:
@@ -82,6 +90,7 @@ def build(
     with_lidar: bool = True,
     with_imu: bool = True,
     with_world: bool = False,
+    moving: frozenset[str] = frozenset(),
 ) -> rrb.Blueprint:
     """Image views on the left; 3D views and IMU plots on the right.
 
@@ -89,6 +98,10 @@ def build(
     frusta and the lidar carried into world coordinates. It shares a tab strip with the
     lidar-fixed view rather than taking its own panel, since the two answer different
     questions about the same data and are rarely wanted side by side.
+
+    ``moving`` names the streams whose images live under the world-rooted entity path
+    instead of the IMU-rooted one, so their 2D view points at the entity they're actually
+    logged to.
     """
 
     panels: list[rrb.BlueprintPart] = []
@@ -149,7 +162,7 @@ def build(
         panels.append(
             rrb.Vertical(
                 contents=[
-                    rrb.Spatial2DView(origin=image_entity(name), name=name)
+                    rrb.Spatial2DView(origin=image_entity(name, moving=name in moving), name=name)
                     for name in streams
                 ],
                 name="images",
