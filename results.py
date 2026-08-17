@@ -7,6 +7,9 @@ A result directory is expected to hold
 * one or more ``*_trajectory.csv`` -- the optimised path of the IMU in the world frame;
 * any number of ``mesh_*.ply`` -- submap meshes whose vertices are already in the world
   frame, so they need no transform to be placed.
+
+:func:`read_pose_stream` reads the same kind of pose rows without attaching any frame
+meaning to them, which is how a moving camera's own pose file is loaded.
 """
 
 from __future__ import annotations
@@ -79,28 +82,63 @@ class Trajectory:
         return len(self.timestamps_ns)
 
 
-def _is_comma_separated(path: Path) -> bool:
-    """Tell the OKVIS CSV apart from the space-separated reference format.
-
-    The OKVIS CSV has commas in its header and in every row; reference files have none.
-    """
+def _first_data_line(path: Path) -> bytes:
+    """First line that is neither blank nor a ``#`` comment, or ``b""`` if there is none."""
     with path.open("rb") as handle:
         for line in handle:
-            if line.strip():
-                return b"," in line
-    return False
+            stripped = line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                return stripped
+    return b""
 
 
-def _load_reference_rows(path: Path) -> np.ndarray:
-    """Rows of a space-separated reference file.
+def _is_comma_separated(path: Path) -> bool:
+    """Tell a comma-separated pose file apart from the space-separated reference format.
+
+    Decided on the first *data* row rather than the first line, because the header is not a
+    reliable witness: a file can pair a space-separated ``# timestamp tx ty tz ...`` comment
+    with comma-separated rows, and judging by the header would then get it backwards.
+    """
+    return b"," in _first_data_line(path)
+
+
+def _load_rows(
+    path: Path, delimiter: str | None = None, usecols: range | None = None
+) -> np.ndarray:
+    """Rows of a whitespace- or comma-separated numeric file.
 
     Both header conventions are in use -- ``#``-commented and bare -- so an uncommented
     header line is skipped on a retry.
     """
     try:
-        return np.loadtxt(path, comments="#", ndmin=2)
+        return np.loadtxt(path, delimiter=delimiter, comments="#", usecols=usecols, ndmin=2)
     except ValueError:
-        return np.loadtxt(path, comments="#", skiprows=1, ndmin=2)
+        return np.loadtxt(
+            path, delimiter=delimiter, comments="#", usecols=usecols, skiprows=1, ndmin=2
+        )
+
+
+def _clean_poses(
+    path: Path, timestamps_ns: np.ndarray, positions: np.ndarray, quaternions: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sort poses by time, drop repeated timestamps, and normalise the quaternions.
+
+    Keeping the first of any duplicate matters because the realtime OKVIS file repeats its
+    final state, and because Rerun's latest-at lookup would otherwise pick between rows
+    sharing a timestamp arbitrarily.
+    """
+    order = np.argsort(timestamps_ns, kind="stable")
+    timestamps_ns = timestamps_ns[order]
+    positions, quaternions = positions[order], quaternions[order]
+
+    unique = np.concatenate(([True], np.diff(timestamps_ns) != 0))
+    timestamps_ns = timestamps_ns[unique]
+    positions, quaternions = positions[unique], quaternions[unique]
+
+    norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
+    if np.any(norms == 0.0):
+        raise ValueError(f"{path}: contains a zero-length quaternion")
+    return timestamps_ns, positions, quaternions / norms
 
 
 def read_trajectory(path: str | Path) -> Trajectory:
@@ -127,7 +165,7 @@ def read_trajectory(path: str | Path) -> Trajectory:
         raw = np.loadtxt(path, delimiter=",", skiprows=1, usecols=range(8),
                          dtype=np.float64, ndmin=2)
     else:
-        raw = _load_reference_rows(path)
+        raw = _load_rows(path)
 
     if raw.size == 0:
         raise ValueError(f"{path}: no pose rows")
@@ -137,25 +175,16 @@ def read_trajectory(path: str | Path) -> Trajectory:
             f"sensors, got {raw.shape[1]}"
         )
 
-    # The realtime OKVIS file repeats its final state; keep the first of any duplicate.
     timestamps = (
         raw[:, 0].astype(np.int64)  # already nanoseconds
         if comma
         else np.rint(raw[:, 0] * NS_PER_S).astype(np.int64)  # seconds -> nanoseconds
     )
-    order = np.argsort(timestamps, kind="stable")
-    raw, timestamps = raw[order], timestamps[order]
-    unique = np.concatenate(([True], np.diff(timestamps) != 0))
-
-    quaternions = raw[unique, 4:8]
-    norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
-    if np.any(norms == 0.0):
-        raise ValueError(f"{path}: contains a zero-length quaternion")
-
+    timestamps, positions, quaternions = _clean_poses(
+        path, timestamps, raw[:, 1:4], raw[:, 4:8]
+    )
     return Trajectory(
-        timestamps_ns=timestamps[unique],
-        positions=raw[unique, 1:4],
-        quaternions=quaternions / norms,
+        timestamps_ns=timestamps, positions=positions, quaternions=quaternions
     )
 
 
@@ -204,6 +233,61 @@ def _slerp(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
     theta = theta_0 * alpha
     sin_theta_0 = np.sin(theta_0)
     return (np.sin(theta_0 - theta) / sin_theta_0) * q0 + (np.sin(theta) / sin_theta_0) * q1
+
+
+# ----------------------------------------------------------------------------------
+# Pose streams
+# ----------------------------------------------------------------------------------
+
+
+@dataclass
+class PoseStream:
+    """A time-stamped sequence of rigid poses, carrying no frame convention of its own.
+
+    What the poses *mean* is decided by whoever composes them -- unlike :class:`Trajectory`,
+    which is specifically the IMU in the world. This is what a moving camera's own pose file
+    is read into: there each pose is ``T_SC``, the camera's placement in the IMU frame.
+    """
+
+    name: str
+    timestamps_ns: np.ndarray  # (N,) int64
+    positions: np.ndarray  # (N, 3)
+    quaternions: np.ndarray  # (N, 4) xyzw, normalised
+
+    def __len__(self) -> int:
+        return len(self.timestamps_ns)
+
+
+def read_pose_stream(path: str | Path) -> PoseStream:
+    """Read ``timestamp tx ty tz qx qy qz qw`` rows, comma- or whitespace-separated.
+
+    Timestamps are **nanoseconds on the dataset clock**, as in the sensor and trajectory
+    CSVs rather than the seconds a reference file uses: a pose stream is only meaningful
+    against the measurements it is being composed with, so it has to share their clock.
+    Only the first eight columns are read, so a trailing comma or extra columns are fine.
+    """
+    path = Path(path)
+    delimiter = "," if _is_comma_separated(path) else None
+    try:
+        raw = _load_rows(path, delimiter=delimiter, usecols=range(8))
+    except (IndexError, ValueError) as error:
+        raise ValueError(
+            f"{path}: expected 8 columns (timestamp, position, xyzw quaternion) "
+            f"of numbers -- {error}"
+        ) from None
+
+    if raw.size == 0:
+        raise ValueError(f"{path}: no pose rows")
+
+    timestamps, positions, quaternions = _clean_poses(
+        path, raw[:, 0].astype(np.int64), raw[:, 1:4], raw[:, 4:8]
+    )
+    return PoseStream(
+        name=path.stem,
+        timestamps_ns=timestamps,
+        positions=positions,
+        quaternions=quaternions,
+    )
 
 
 # ----------------------------------------------------------------------------------
@@ -421,7 +505,7 @@ def read_ground_truth(path: str | Path) -> GroundTruth:
     without orientation is fine.
     """
     path = Path(path)
-    raw = _load_reference_rows(path)
+    raw = _load_rows(path)
     if raw.shape[1] < 4:
         raise ValueError(f"{path}: expected at least 4 columns, got {raw.shape[1]}")
 

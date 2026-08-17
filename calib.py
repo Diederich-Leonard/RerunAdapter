@@ -49,6 +49,24 @@ class Calibration:
     T_SL: np.ndarray | None  # (4, 4) lidar -> IMU, absent in configs without a lidar
 
 
+def rigid(translation: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
+    """4x4 rigid transform from a translation and a unit **xyzw** quaternion.
+
+    The quaternion is assumed normalised, which the pose readers guarantee; the standard
+    rotation matrix is written out rather than pulled from scipy to keep the dependency
+    list at numpy and PyYAML.
+    """
+    x, y, z, w = (float(value) for value in quaternion_xyzw)
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = [
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ]
+    T[:3, 3] = translation
+    return T
+
+
 def invert(T: np.ndarray) -> np.ndarray:
     """Inverse of a rigid 4x4 transform, without a general matrix inverse."""
     R = T[:3, :3]

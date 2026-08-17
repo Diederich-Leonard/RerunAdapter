@@ -67,7 +67,8 @@ frame and the viewer does the placing — no point cloud or mesh is transformed 
 /world/mesh/<name>            static Mesh3D             -> vertices already in world frame
 /world/imu                    Transform3D per pose      -> T_WS from the trajectory
 /world/imu/body               static Transform3D        -> T_SB, i.e. inverse of T_BS
-/world/imu/<stream>           static Transform3D        -> T_SC for that camera
+/world/imu/<stream>           Transform3D per pose      -> T_SC for that camera (static,
+                              unless the camera is moved with --camera-pose)
 /world/imu/<stream>/image     static Pinhole + Image (undistorted, with --undistort) or EncodedImage per frame
 /world/imu/lidar0             static Transform3D        -> T_SL
 /world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
@@ -117,6 +118,37 @@ python3 ./viz.py <dataset_path> --config <okvis2.yaml> --undistort
 Without `--undistort`, or for any other `distortion_type` (`radialtangential`, `none`, ...),
 frames are left as the still-distorted encoded bytes, same as without `--config` at all.
 
+## Moving a camera
+
+A camera on a gimbal, or one whose extrinsics are being re-estimated online, does not sit
+where the config says it does. `--camera-pose` gives one camera a pose file of its own:
+
+```bash
+python3 ./viz.py <dataset_path> --config <okvis2.yaml> \
+    --camera-pose cam0=../../results/cam_pose_estimate.csv
+```
+
+The left-hand side names the image stream to move, so the flag can be repeated to move
+several cameras independently, and only cameras the config actually pairs with a stream can
+be named. `--config` is required — its `T_SC` for that camera is what the pose file
+replaces, and its intrinsics are still what the pinhole is drawn from.
+
+Each row is `timestamp tx ty tz qx qy qz qw`, comma- or space-separated, `#`-commented
+header optional. **Timestamps are nanoseconds** on the dataset clock, like the sensor and
+trajectory CSVs rather than the seconds a `--groundtruth` file uses; a stream that overlaps
+nothing else is reported as a warning, since that is what a unit mix-up looks like.
+
+The pose is read as the camera's placement **in the IMU frame**, i.e. `T_SC` directly — the
+same convention the config's static extrinsics use, just varying over time instead of fixed.
+It is logged on the camera's usual entity, `/world/imu/<stream>`, simply replacing the
+config's static `T_SC` there with one that changes per timestamp. The pinhole, the frustum,
+the images and the coordinate triad all hang off that entity, so they follow the moving
+camera without anything else changing.
+
+Like the trajectory, a pose file is loaded whole regardless of `--start` / `--duration`, and
+its first pose is held from the beginning of the timeline so the camera never falls back to
+the IMU origin before the stream starts.
+
 ## Ground truth alignment
 
 `--groundtruth` takes a space-separated reference file (`timestamp tx ty tz ...`, timestamps
@@ -153,6 +185,7 @@ monotonic normalisation over their whole domain rather than a linear window with
 | `--mesh-regex REGEX` | filename a mesh must fully match (default `mesh_.*\.ply`) |
 | `--config FILE` | OKVIS config supplying `T_SC`, `T_SL`, `T_BS` |
 | `--trajectory FILE` | explicit trajectory, instead of the one picked from `--results` |
+| `--camera-pose STREAM=FILE` | move one camera over time, replacing its nominal `T_SC` with a per-pose one; repeatable |
 | `--groundtruth FILE` | reference trajectory, rigidly aligned before plotting |
 | `--undistort` | undistort images from an `equidistant` `--config` camera (default: leave encoded) |
 | `--lidar-frequency HZ` | scan interval is 1/HZ (default `10`) |
@@ -167,7 +200,7 @@ monotonic normalisation over their whole domain rather than a linear window with
 ```
 viz.py         CLI, the logging loop, and the only Rerun logging calls
 euroc.py       stream discovery + readers (images, IMU, streaming lidar) — no Rerun
-results.py     trajectory and submap mesh readers, pose interpolation — no Rerun
+results.py     trajectory, pose stream and mesh readers, pose interpolation — no Rerun
 calib.py       OKVIS config -> intrinsics and T_SC / T_SL / T_BS — no Rerun
 undistort.py   the equidistant (fisheye) camera model: backward map (numpy) + resample (cv2)
 blueprint.py   entity paths and the default view layout
@@ -205,4 +238,7 @@ undistorted before logging instead; see [Undistortion](#undistortion).
   OKVIS config has that section.
 - **No motion compensation within a scan**, and the whole scan is logged at the start of
   its interval.
+- **`--camera-pose` is applied latest-at, not interpolated**, unlike the trajectory: a frame
+  gets the most recent camera pose at or before its timestamp. The pose files in use run at
+  roughly the frame rate, so the two rates match; a much slower one would visibly lag.
 - **The IMU is not drawn in the 3D view**, only as the frame triad and the two graphs.

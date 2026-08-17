@@ -18,10 +18,14 @@ This is the only module that talks to Rerun's logging API; ``euroc.py`` reads th
 ``results.py`` the trajectory and meshes, ``calib.py`` the extrinsics, and ``blueprint.py``
 owns the entity paths and the view layout.
 
+A camera that does not sit still can be given its own pose file with ``--camera-pose``,
+which replaces the config's fixed ``T_SC`` for that camera with one that varies over time.
+
 Usage:
     python viz.py <dataset_path>
     python viz.py <dataset_path> --start 30 --duration 20
     python viz.py <dataset_path> --results <results_dir> --config <okvis2.yaml>
+    python viz.py <dataset_path> --config <okvis2.yaml> --camera-pose cam0=<poses.csv>
     python viz.py <dataset_path> --save scene.rrd
 """
 
@@ -83,6 +87,17 @@ def mesh_regex(text: str) -> str:
     return text
 
 
+def camera_pose(text: str) -> tuple[str, Path]:
+    """Parse a ``STREAM=FILE`` pair, naming which camera a pose file belongs to."""
+    stream, separator, file = text.partition("=")
+    if not separator or not stream.strip() or not file.strip():
+        raise argparse.ArgumentTypeError(
+            f"expected STREAM=FILE naming the camera to move (e.g. cam0=poses.csv), "
+            f"got {text!r}"
+        )
+    return stream.strip(), Path(file.strip())
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -119,6 +134,14 @@ def parse_args() -> argparse.Namespace:
         help="regex a mesh filename must match in full to be loaded from --results; a "
              "result directory can hold more than one set "
              f"(default: {results.DEFAULT_MESH_PATTERN})",
+    )
+    overlay.add_argument(
+        "--camera-pose", type=camera_pose, action="append", default=[],
+        metavar="STREAM=FILE", dest="camera_poses",
+        help="move one camera over time: FILE holds that camera's pose in the IMU frame, "
+             "i.e. T_SC (timestamp, position, xyzw quaternion; nanoseconds), and STREAM "
+             "names the image stream it belongs to, e.g. cam0=cam_pose_estimate.csv. "
+             "Repeat for more than one camera. Needs --config",
     )
     overlay.add_argument(
         "--groundtruth", type=Path, default=None, metavar="FILE",
@@ -186,12 +209,12 @@ def time_column(timestamps_ns: np.ndarray) -> rr.TimeColumn:
 # ----------------------------------------------------------------------------------
 
 
-def log_transform(entity: str, T: np.ndarray) -> None:
-    """Log a static 4x4 transform mapping this entity's frame into its parent's."""
+def log_transform(entity: str, T: np.ndarray, *, static: bool = True) -> None:
+    """Log a 4x4 transform mapping this entity's frame into its parent's."""
     rr.log(
         entity,
         rr.Transform3D(translation=T[:3, 3], mat3x3=T[:3, :3]),
-        static=True,
+        static=static,
     )
 
 
@@ -222,9 +245,19 @@ def log_pose(timestamp_ns: int, position: np.ndarray, quaternion_xyzw: np.ndarra
 
 
 def log_calibration(
-    calibration: calib.Calibration, streams: list[str], *, with_lidar: bool
+    calibration: calib.Calibration,
+    streams: list[str],
+    *,
+    with_lidar: bool,
+    moving: frozenset[str] = frozenset(),
 ) -> None:
-    """Log the static rig: body, camera and lidar frames relative to the IMU."""
+    """Log the static rig: body, camera and lidar frames relative to the IMU.
+
+    Cameras named in ``moving`` get no static ``T_SC`` here, because
+    :func:`log_camera_poses` logs theirs per timestamp instead. Logging both is not an
+    option: Rerun gives static data precedence over temporal data on the same component, so
+    a static transform would silently shadow the moving one.
+    """
     log_frame_axes(bp.IMU)
 
     # The config gives T_BS, which maps IMU coordinates into the body frame. Hanging the
@@ -234,7 +267,8 @@ def log_calibration(
 
     for name, camera in zip(streams, calibration.cameras):
         entity = bp.stream_entity(name)
-        log_transform(entity, camera.T_SC)
+        if name not in moving:
+            log_transform(entity, camera.T_SC)
         log_frame_axes(entity)
         rr.log(
             bp.image_entity(name),
@@ -252,6 +286,38 @@ def log_calibration(
         if calibration.T_SL is not None:
             log_transform(bp.LIDAR, calibration.T_SL)
         log_frame_axes(bp.LIDAR)
+
+
+def log_camera_poses(
+    name: str,
+    stream: results.PoseStream,
+    clamp_start_ns: int | None = None,
+) -> None:
+    """Stream one camera's extrinsics, straight from its pose file.
+
+    Each row is already ``T_SC``, the camera's placement in the IMU frame -- the same
+    convention the config's static extrinsics use -- so it is logged as-is on the usual
+    :func:`blueprint.stream_entity`, replacing the config's fixed ``T_SC`` for this camera
+    with one that varies over time.
+
+    Everything hanging off the camera -- its pinhole, its frustum, its images and its triad
+    -- is a child entity, so it all follows from this one transform.
+    """
+    entity = bp.stream_entity(name)
+
+    def placed(index: int) -> np.ndarray:
+        return calib.rigid(stream.positions[index], stream.quaternions[index])
+
+    # Rerun's latest-at lookup finds nothing before the first row, which would collapse the
+    # camera onto the IMU for the opening stretch of the timeline. Holding the first pose
+    # from the start of the recording keeps it at a sensible placement instead.
+    if clamp_start_ns is not None and clamp_start_ns < int(stream.timestamps_ns[0]):
+        set_time(clamp_start_ns)
+        log_transform(entity, placed(0), static=False)
+
+    for index, timestamp_ns in enumerate(stream.timestamps_ns):
+        set_time(int(timestamp_ns))
+        log_transform(entity, placed(index), static=False)
 
 
 # ----------------------------------------------------------------------------------
@@ -364,14 +430,15 @@ def log_image(
     both when there is no map for this stream and when the on-disk image no longer matches
     the map's resolution -- the caller distinguishes those by whether it passed a map in.
     """
+    entity = bp.image_entity(name)
     if undistort_map is not None:
         map_x, map_y = undistort_map
         image = euroc.read_image(path)
         if image.shape[:2] == map_x.shape:
             undistorted = undistort.remap(image, map_x, map_y)
-            rr.log(bp.image_entity(name), rr.Image(undistorted).compress())
+            rr.log(entity, rr.Image(undistorted).compress())
             return True
-    rr.log(bp.image_entity(name), rr.EncodedImage(path=path))
+    rr.log(entity, rr.EncodedImage(path=path))
     return False
 
 
@@ -456,6 +523,42 @@ def load_undistort_maps(
     return maps
 
 
+def load_camera_poses(
+    args: argparse.Namespace,
+    streams: list[str],
+    calibration: calib.Calibration | None,
+) -> dict[str, results.PoseStream]:
+    """Resolve ``--camera-pose STREAM=FILE`` into one pose stream per named camera.
+
+    The names are checked against the cameras that actually exist in this run, so a typo or
+    a stream excluded by ``--no-images`` is reported up front rather than silently moving
+    nothing.
+    """
+    if not args.camera_poses:
+        return {}
+    if calibration is None:
+        raise ValueError(
+            "--camera-pose needs --config, which supplies the camera's pinhole model"
+        )
+
+    # Cameras are paired with image streams in order, so only the paired ones have a
+    # nominal T_SC to replace.
+    placeable = streams[: len(calibration.cameras)]
+
+    loaded: dict[str, results.PoseStream] = {}
+    for name, path in args.camera_poses:
+        if name in loaded:
+            raise ValueError(f"--camera-pose given more than once for {name!r}")
+        if name not in placeable:
+            known = ", ".join(placeable) if placeable else "none"
+            raise ValueError(
+                f"--camera-pose names {name!r}, which is not a camera in this run "
+                f"(cameras that can be moved: {known})"
+            )
+        loaded[name] = results.read_pose_stream(path)
+    return loaded
+
+
 def main() -> int:
     args = parse_args()
 
@@ -510,6 +613,7 @@ def main() -> int:
     try:
         trajectory, trajectory_path, mesh_paths = load_results(args)
         calibration = calib.load(args.config) if args.config is not None else None
+        camera_poses = load_camera_poses(args, list(images), calibration)
         undistort_maps = (
             load_undistort_maps(calibration, list(images)) if args.undistort else {}
         )
@@ -580,6 +684,27 @@ def main() -> int:
     if trajectory is not None and len(trajectory):
         spans.append((int(trajectory.timestamps_ns[0]), int(trajectory.timestamps_ns[-1])))
 
+    # Camera pose streams are loaded whole, like the trajectory, so they extend the timeline
+    # too. Each is checked against the rest of the recording before being folded in, because
+    # a stream whose timestamps are in the wrong unit overlaps nothing and is otherwise easy
+    # to mistake for a camera that simply never moves.
+    others_start = min((span[0] for span in spans), default=None)
+    others_end = max((span[1] for span in spans), default=None)
+    for name, pose_stream in camera_poses.items():
+        first_ns = int(pose_stream.timestamps_ns[0])
+        last_ns = int(pose_stream.timestamps_ns[-1])
+        if others_start is not None and (last_ns < others_start or first_ns > others_end):
+            print(
+                f"warning: the {name} pose stream covers "
+                f"{first_ns / euroc.NS_PER_S:.1f} .. {last_ns / euroc.NS_PER_S:.1f} s, "
+                f"which does not overlap the rest of the recording "
+                f"({others_start / euroc.NS_PER_S:.1f} .. "
+                f"{others_end / euroc.NS_PER_S:.1f} s); its timestamps must be nanoseconds "
+                f"on the dataset clock",
+                file=sys.stderr,
+            )
+        spans.append((first_ns, last_ns))
+
     # Meshes and the reference trajectory are static, so they are worth showing even with no
     # time-varying stream at all.
     has_static = bool(mesh_paths) or ground_truth is not None
@@ -588,13 +713,13 @@ def main() -> int:
         return 2
 
     print(f"{dataset.root}")
+    timeline_start_ns = min((span[0] for span in spans), default=None)
     if spans:
-        start_ns = min(span[0] for span in spans)
         end_ns = max(span[1] for span in spans)
         print(
-            f"  timeline {start_ns / euroc.NS_PER_S:.3f} .. "
+            f"  timeline {timeline_start_ns / euroc.NS_PER_S:.3f} .. "
             f"{end_ns / euroc.NS_PER_S:.3f} s "
-            f"({(end_ns - start_ns) / euroc.NS_PER_S:.1f} s)"
+            f"({(end_ns - timeline_start_ns) / euroc.NS_PER_S:.1f} s)"
         )
     if window_start_ns is not None:
         end_text = (
@@ -606,6 +731,8 @@ def main() -> int:
         )
     if trajectory is not None:
         print(f"  traj     {trajectory_path.name}: {len(trajectory)} poses")
+    for name, pose_stream in camera_poses.items():
+        print(f"  campose  {pose_stream.name}: {len(pose_stream)} poses -> {name}")
     if mesh_paths:
         print(f"           {len(mesh_paths)} mesh files")
     if lidar_reader is not None:
@@ -673,7 +800,14 @@ def main() -> int:
     if with_world:
         log_frame_axes(bp.WORLD, WORLD_AXIS_LENGTH)
     if calibration is not None:
-        log_calibration(calibration, list(images), with_lidar=lidar_reader is not None)
+        log_calibration(
+            calibration,
+            list(images),
+            with_lidar=lidar_reader is not None,
+            moving=frozenset(camera_poses),
+        )
+        for name, pose_stream in camera_poses.items():
+            log_camera_poses(name, pose_stream, timeline_start_ns)
 
     # Poses are interpolated onto the timestamp of whatever is being placed. The trajectory
     # runs at the estimator's rate, so without this a lidar scan would inherit a pose up to
