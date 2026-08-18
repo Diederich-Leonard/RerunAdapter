@@ -92,13 +92,20 @@ def build(
 
     panels: list[rrb.BlueprintPart] = []
 
-    
     views_3d: list[rrb.BlueprintPart] = []
     if with_world:
         views_3d.append(
             rrb.Spatial3DView(
                 origin=WORLD,
                 name="world",
+                line_grid=rrb.LineGrid3D(visible=True),
+            )
+        )
+    if with_lidar:
+        views_3d.append(
+            rrb.Spatial3DView(
+                origin=LIDAR,  # <- the lidar-fixed frame
+                name="lidar0 (sensor frame)",
                 line_grid=rrb.LineGrid3D(visible=True),
             )
         )
@@ -120,13 +127,21 @@ def build(
             )
         )
 
-    if views_3d and not imu:
-        panels.append(views_3d[0])
-    elif views_3d and imu:
-        left: list[rrb.BlueprintPart] = [views_3d[0]]
-        left.append(rrb.Horizontal(*imu))
-        panels.append(rrb.Vertical(*left, row_shares=[4, 1]))
-    elif not views_3d and imu:
+    # Both 3D views show the same points in different frames, so they share a tab strip
+    # rather than halving each other's width.
+    spatial = (
+        None
+        if not views_3d
+        else views_3d[0]
+        if len(views_3d) == 1
+        else rrb.Tabs(*views_3d, name="3D")
+    )
+
+    if spatial is not None and not imu:
+        panels.append(spatial)
+    elif spatial is not None and imu:
+        panels.append(rrb.Vertical(spatial, rrb.Horizontal(*imu), row_shares=[4, 1]))
+    elif imu:
         panels.append(rrb.Vertical(*imu))
 
     if streams:
