@@ -6,11 +6,9 @@ Because an OKVIS calibration expresses both cameras and lidar relative to the IM
 trajectory gives the IMU's pose in the world, the IMU frame S is the natural moving root::
 
     /world                        static ViewCoordinates (z up)
-    /world/axes                   static Arrows3D -- world frame triad
     /world/trajectory             static LineStrips3D -- the whole estimated path
     /world/mesh/<name>            static Mesh3D -- vertices already in world coordinates
     /world/imu                    Transform3D per pose: T_WS, from the trajectory
-    /world/imu/axes               static Arrows3D
     /world/imu/body               static Transform3D: T_SB, i.e. inverse of the config T_BS
     /world/imu/<stream>           Transform3D per pose: T_SC for a *static* camera (one not
                                   named in --camera-pose)
@@ -73,11 +71,6 @@ def stream_entity(name: str, *, moving: bool = False) -> str:
 def image_entity(name: str, *, moving: bool = False) -> str:
     """Entity holding one image stream's pinhole model and images."""
     return f"{stream_entity(name, moving=moving)}/image"
-
-
-def axes_entity(frame: str) -> str:
-    """Child entity carrying a frame's coordinate triad, so it can be toggled on its own."""
-    return f"{frame}/axes"
 
 
 def mesh_entity(name: str) -> str:

@@ -8,8 +8,8 @@ lidar is shown in a lidar-fixed 3D view, and the IMU is split into two graphs.
 
 *With results* -- add ``--results`` and ``--config`` to overlay a SLAM run. A world-frame 3D
 view then shows the estimated trajectory, the submap meshes, every camera as a posed pinhole
-frustum, the lidar carried into world coordinates, and each frame (world, IMU, body,
-cameras, lidar) as a coordinate triad.
+frustum, the lidar carried into world coordinates, and each posed frame (IMU, body, cameras,
+lidar) as a coordinate triad, which Rerun draws from the transforms themselves.
 
 Nothing about the sensor count is hardcoded: image streams are discovered from the directory
 layout, so two cameras or five work the same way. One IMU and one lidar are assumed.
@@ -52,12 +52,8 @@ import undistort
 #: keeps a sparse cloud visible whether you are 1 m or 100 m from it.
 POINT_RADIUS_UI = -1.0
 
-#: Per-axis colours, shared by the IMU plots and the coordinate triads so x/y/z read alike.
+#: Per-axis colours for the IMU plots, so x/y/z read alike.
 AXIS_COLORS = ((230, 80, 80), (90, 200, 110), (90, 150, 240))
-
-#: Coordinate triad sizes in metres: the world origin gets a longer one so it stands out.
-FRAME_AXIS_LENGTH = 0.5
-WORLD_AXIS_LENGTH = 0.5
 
 #: How far in front of each camera to draw its frustum, in metres.
 IMAGE_PLANE_DISTANCE = 1.0
@@ -221,25 +217,6 @@ def log_transform(entity: str, T: np.ndarray, *, static: bool = True) -> None:
     )
 
 
-def log_frame_axes(frame: str, length: float = FRAME_AXIS_LENGTH) -> None:
-    """Draw a frame's coordinate triad.
-
-    Rerun 0.35's ``Transform3D`` has no ``axis_length``, so the axes are drawn explicitly.
-    They go on a child entity, which both keeps them separately toggleable and lets them
-    inherit the frame's transform, so the triad follows its frame for free.
-    """
-    rr.log(
-        bp.axes_entity(frame),
-        rr.Arrows3D(
-            vectors=np.eye(3) * length,
-            origins=np.zeros((3, 3)),
-            colors=list(AXIS_COLORS),
-            radii=[length * 0.03],
-        ),
-        static=True,
-    )
-
-
 def log_pose(timestamp_ns: int, position: np.ndarray, quaternion_xyzw: np.ndarray) -> None:
     """Place the IMU frame S in the world at ``timestamp_ns``."""
     set_time(timestamp_ns)
@@ -261,19 +238,15 @@ def log_calibration(
     option: Rerun gives static data precedence over temporal data on the same component, so
     a static transform would silently shadow the moving one.
     """
-    log_frame_axes(bp.IMU)
-
     # The config gives T_BS, which maps IMU coordinates into the body frame. Hanging the
     # body frame under the IMU needs the opposite direction.
     log_transform(bp.BODY, calib.invert(calibration.T_BS))
-    log_frame_axes(bp.BODY)
 
     for name, camera in zip(streams, calibration.cameras):
         is_moving = name in moving
         entity = bp.stream_entity(name, moving=is_moving)
         if not is_moving:
             log_transform(entity, camera.T_SC)
-        log_frame_axes(entity)
         rr.log(
             bp.image_entity(name, moving=is_moving),
             rr.Pinhole(
@@ -286,10 +259,8 @@ def log_calibration(
             static=True,
         )
 
-    if with_lidar:
-        if calibration.T_SL is not None:
-            log_transform(bp.LIDAR, calibration.T_SL)
-        log_frame_axes(bp.LIDAR)
+    if with_lidar and calibration.T_SL is not None:
+        log_transform(bp.LIDAR, calibration.T_SL)
 
 
 def log_camera_poses(
@@ -304,8 +275,8 @@ def log_camera_poses(
     rather than under ``/world/imu``: nesting it there would compose ``T_WS * T_WC``, which
     is wrong now that the file gives a world-frame pose rather than ``T_SC``.
 
-    Everything hanging off the camera -- its pinhole, its frustum, its images and its triad
-    -- is a child entity, so it all follows from this one transform.
+    Everything hanging off the camera -- its pinhole, its frustum, its images -- is a child
+    entity, so it all follows from this one transform, as does the triad Rerun draws for it.
     """
     entity = bp.stream_entity(name, moving=True)
 
@@ -808,8 +779,6 @@ def main() -> int:
     started = time.perf_counter()
 
     log_static_scene(with_lidar=lidar_reader is not None)
-    if with_world:
-        log_frame_axes(bp.WORLD, WORLD_AXIS_LENGTH)
     if calibration is not None:
         log_calibration(
             calibration,

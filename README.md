@@ -29,8 +29,8 @@ python3 ./viz.py <dataset_path> \
 ```
 
 That adds a world-frame 3D view with the estimated trajectory, the submap meshes, every
-camera as a posed pinhole frustum, the lidar carried into world coordinates, and each frame
-as a coordinate triad. `--results` picks the most refined `*_trajectory.csv` it finds
+camera as a posed pinhole frustum, the lidar carried into world coordinates, and each posed
+frame as a coordinate triad, which Rerun draws from the transforms themselves. `--results` picks the most refined `*_trajectory.csv` it finds
 (`-final-ba` over `-final` over the realtime one); `--trajectory FILE` overrides that.
 
 `--trajectory` also works on its own, and takes a reference file as readily as an OKVIS CSV,
@@ -61,7 +61,6 @@ frame and the viewer does the placing — no point cloud or mesh is transformed 
 
 ```
 /world                        static ViewCoordinates (z up)
-/world/axes                   static Arrows3D           -> world frame triad
 /world/trajectory             static LineStrips3D       -> the whole estimated path
 /world/groundtruth            static LineStrips3D       -> reference path, aligned (green)
 /world/mesh/<name>            static Mesh3D             -> vertices already in world frame
@@ -163,9 +162,9 @@ lets a JSON pose file be used without ever needing the matching world-frame traj
 
 Either way, once resolved to `T_WC`, the pose is logged on a world-rooted entity,
 `/world/<stream>`, instead of the static camera's usual `/world/imu/<stream>`, so it isn't
-also carried by the IMU's `T_WS`. The pinhole, the frustum, the images and the coordinate
-triad all hang off that entity, so they follow the moving camera without anything else
-changing.
+also carried by the IMU's `T_WS`. The pinhole, the frustum and the images all hang off that
+entity, so they follow the moving camera — as does its coordinate triad — without anything
+else changing.
 
 Like the trajectory, a pose file is loaded whole regardless of `--start` / `--duration`, and
 its first pose is held from the beginning of the timeline so the camera never falls back to
