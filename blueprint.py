@@ -20,6 +20,8 @@ trajectory gives the IMU's pose in the world, the IMU frame S is the natural mov
     /world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
     /plots/imu/accel/{x,y,z}      whole series, sent columnar
     /plots/imu/gyro/{x,y,z}       "
+    /plots/bias/gyro/{x,y,z}      estimated b_g from the trajectory file, sent columnar
+    /plots/bias/accel/{x,y,z}     estimated b_a, "
 
 Two consequences worth spelling out:
 
@@ -31,8 +33,11 @@ Two consequences worth spelling out:
   ``/world/imu/lidar0`` is lidar-fixed, while one rooted at ``/world`` shows the same points
   carried into the world by ``T_SL`` then ``T_WS``. No duplicated data.
 
-The IMU scalar plots sit outside ``/world`` so the world view's default ``$origin/**``
-contents never sweeps up non-spatial entities.
+The scalar plots sit outside ``/world`` so the world view's default ``$origin/**`` contents
+never sweeps up non-spatial entities. The measured IMU and the estimated biases are kept on
+separate paths because they are separate stories about the same sensor -- one is dataset
+input, the other estimator output -- and because a bias in the tens of milli-units would be
+a flat line next to a raw acceleration.
 """
 
 from __future__ import annotations
@@ -56,6 +61,9 @@ LIDAR_POINTS = f"{LIDAR}/points"
 IMU_PLOTS = "/plots/imu"
 IMU_ACCEL_PLOT = f"{IMU_PLOTS}/accel"
 IMU_GYRO_PLOT = f"{IMU_PLOTS}/gyro"
+BIAS_PLOTS = "/plots/bias"
+GYRO_BIAS_PLOT = f"{BIAS_PLOTS}/gyro"
+ACCEL_BIAS_PLOT = f"{BIAS_PLOTS}/accel"
 
 
 def stream_entity(name: str, *, moving: bool = False) -> str:
@@ -82,15 +90,20 @@ def build(
     *,
     with_lidar: bool = True,
     with_imu: bool = True,
+    with_biases: bool = False,
     with_world: bool = False,
     moving: frozenset[str] = frozenset(),
 ) -> rrb.Blueprint:
-    """Image views on the left; 3D views and IMU plots on the right.
+    """Image views on the left; 3D views and scalar plots on the right.
 
     ``with_world`` adds the world-frame 3D view that shows the trajectory, meshes, camera
     frusta and the lidar carried into world coordinates. It shares a tab strip with the
     lidar-fixed view rather than taking its own panel, since the two answer different
     questions about the same data and are rarely wanted side by side.
+
+    ``with_biases`` adds the estimated IMU bias plots, which only exist when the trajectory
+    file carried them; they take a row of their own beneath the measured IMU plots rather
+    than sharing one, so four plots never end up quartering the panel's width.
 
     ``moving`` names the streams whose images live under the world-rooted entity path
     instead of the IMU-rooted one, so their 2D view points at the entity they're actually
@@ -117,20 +130,26 @@ def build(
             )
         )
 
-    imu: list[rrb.BlueprintPart] = []
+    def time_series(origin: str, name: str) -> rrb.BlueprintPart:
+        return rrb.TimeSeriesView(
+            origin=origin,
+            name=name,
+            plot_legend=rrb.PlotLegend(corner=rrb.Corner2D.RightBottom),
+        )
+
+    plot_rows: list[rrb.BlueprintPart] = []
     if with_imu:
-        imu.append(
-            rrb.TimeSeriesView(
-                origin=IMU_ACCEL_PLOT,
-                name="acceleration [m/s^2]",
-                plot_legend=rrb.PlotLegend(corner=rrb.Corner2D.RightBottom),
+        plot_rows.append(
+            rrb.Horizontal(
+                time_series(IMU_ACCEL_PLOT, "acceleration [m/s^2]"),
+                time_series(IMU_GYRO_PLOT, "angular rate [rad/s]"),
             )
         )
-        imu.append(
-            rrb.TimeSeriesView(
-                origin=IMU_GYRO_PLOT,
-                name="angular rate [rad/s]",
-                plot_legend=rrb.PlotLegend(corner=rrb.Corner2D.RightBottom),
+    if with_biases:
+        plot_rows.append(
+            rrb.Horizontal(
+                time_series(ACCEL_BIAS_PLOT, "accel bias [m/s^2]"),
+                time_series(GYRO_BIAS_PLOT, "gyro bias [rad/s]"),
             )
         )
 
@@ -144,12 +163,14 @@ def build(
         else rrb.Tabs(*views_3d, name="3D")
     )
 
-    if spatial is not None and not imu:
+    if spatial is not None and not plot_rows:
         panels.append(spatial)
-    elif spatial is not None and imu:
-        panels.append(rrb.Vertical(spatial, rrb.Horizontal(*imu), row_shares=[4, 1]))
-    elif imu:
-        panels.append(rrb.Vertical(*imu))
+    elif spatial is not None and plot_rows:
+        panels.append(
+            rrb.Vertical(spatial, *plot_rows, row_shares=[4] + [1] * len(plot_rows))
+        )
+    elif plot_rows:
+        panels.append(rrb.Vertical(*plot_rows))
 
     if streams:
         panels.append(

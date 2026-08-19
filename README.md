@@ -76,6 +76,8 @@ frame and the viewer does the placing — no point cloud or mesh is transformed 
 /world/imu/lidar0/points      Points3D per scan, in raw sensor coordinates
 /plots/imu/accel/{x,y,z}      scalar series, columnar   -> view "acceleration [m/s^2]"
 /plots/imu/gyro/{x,y,z}                                 -> view "angular rate [rad/s]"
+/plots/bias/accel/{x,y,z}     scalar series, columnar   -> view "accel bias [m/s^2]"
+/plots/bias/gyro/{x,y,z}      (from the trajectory)     -> view "gyro bias [rad/s]"
 ```
 
 The IMU frame `S` is the moving root, because an OKVIS calibration expresses both cameras

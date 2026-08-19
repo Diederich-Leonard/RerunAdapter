@@ -25,6 +25,10 @@ from scipy.spatial.transform import Rotation
 
 NS_PER_S = 1_000_000_000
 
+#: Columns of a full-state OKVIS trajectory row: timestamp, p_WS_W, q_WS, v_WS_W, b_g, b_a.
+#: A file at least this wide carries the biases; a narrower one is pose-only.
+_STATE_COLUMNS = 17
+
 
 def _natural_key(name: str) -> tuple:
     return tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name))
@@ -75,11 +79,19 @@ def find_meshes(results_dir: Path, pattern: str | re.Pattern = DEFAULT_MESH_PATT
 
 @dataclass
 class Trajectory:
-    """Estimated poses of the IMU frame S in the world frame W."""
+    """Estimated poses of the IMU frame S in the world frame W, and the states beside them.
+
+    The IMU biases are part of what OKVIS estimates, so they ride along in the same rows as
+    the poses. They stay ``None`` for a pose-only file -- the reference format and the
+    per-camera CSVs carry eight columns and nothing else -- which is what makes them
+    optional here rather than required.
+    """
 
     timestamps_ns: np.ndarray  # (N,) int64
     positions: np.ndarray  # (N, 3) p_WS_W
     quaternions: np.ndarray  # (N, 4) q_WS as xyzw
+    gyro_biases: np.ndarray | None = None  # (N, 3) b_g, rad/s
+    accel_biases: np.ndarray | None = None  # (N, 3) b_a, m/s^2
 
     def __len__(self) -> int:
         return len(self.timestamps_ns)
@@ -105,6 +117,18 @@ def _is_comma_separated(path: Path) -> bool:
     return b"," in _first_data_line(path)
 
 
+def _comma_column_count(path: Path) -> int:
+    """Number of populated fields in the first data row of a comma-separated file.
+
+    The rows of an OKVIS CSV carry a trailing comma, so the last field is empty and is not
+    counted -- otherwise every file would look one column wider than it is.
+    """
+    fields = _first_data_line(path).split(b",")
+    while fields and not fields[-1].strip():
+        fields.pop()
+    return len(fields)
+
+
 def _load_rows(
     path: Path, delimiter: str | None = None, usecols: range | None = None
 ) -> np.ndarray:
@@ -121,27 +145,38 @@ def _load_rows(
         )
 
 
-def _clean_poses(
-    path: Path, timestamps_ns: np.ndarray, positions: np.ndarray, quaternions: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sort poses by time, drop repeated timestamps, and normalise the quaternions.
+def _pose_order(timestamps_ns: np.ndarray) -> np.ndarray:
+    """Row indices that put the poses in time order, keeping the first of any duplicate.
 
-    Keeping the first of any duplicate matters because the realtime OKVIS file repeats its
+    Returned as indices rather than applied here, so every per-row quantity in a file --
+    poses and the biases beside them -- can be reordered the same way.
+
+    Keeping the first of a duplicate matters because the realtime OKVIS file repeats its
     final state, and because Rerun's latest-at lookup would otherwise pick between rows
     sharing a timestamp arbitrarily.
     """
     order = np.argsort(timestamps_ns, kind="stable")
-    timestamps_ns = timestamps_ns[order]
-    positions, quaternions = positions[order], quaternions[order]
+    unique = np.concatenate(([True], np.diff(timestamps_ns[order]) != 0))
+    return order[unique]
 
-    unique = np.concatenate(([True], np.diff(timestamps_ns) != 0))
-    timestamps_ns = timestamps_ns[unique]
-    positions, quaternions = positions[unique], quaternions[unique]
 
+def _normalise_quaternions(path: Path, quaternions: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
     if np.any(norms == 0.0):
         raise ValueError(f"{path}: contains a zero-length quaternion")
-    return timestamps_ns, positions, quaternions / norms
+    return quaternions / norms
+
+
+def _clean_poses(
+    path: Path, timestamps_ns: np.ndarray, positions: np.ndarray, quaternions: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sort poses by time, drop repeated timestamps, and normalise the quaternions."""
+    keep = _pose_order(timestamps_ns)
+    return (
+        timestamps_ns[keep],
+        positions[keep],
+        _normalise_quaternions(path, quaternions[keep]),
+    )
 
 
 def read_trajectory(path: str | Path) -> Trajectory:
@@ -151,11 +186,12 @@ def read_trajectory(path: str | Path) -> Trajectory:
     estimated one does, which is what makes the dataset viewable in a world frame before
     any SLAM output exists.
 
-    * **OKVIS CSV** -- comma separated, one header line, timestamps in nanoseconds. Only
-      the first eight columns are read (``timestamp``, ``p_WS_W_{xyz}``, ``q_WS_{xyzw}``),
-      which is deliberate rather than lazy: the rows carry a trailing comma, so a
-      full-width parse sees one more field than the header names, and the ``-final``
-      variants append an unnamed ``keyframeId`` column on top of that.
+    * **OKVIS CSV** -- comma separated, one header line, timestamps in nanoseconds. The
+      columns read are named explicitly rather than taken as "all of them": the rows carry
+      a trailing comma, so a full-width parse sees one more field than the header names,
+      and the ``-final`` variants append further unnamed columns on top of that. A
+      full-state file (17 columns or more) also yields the IMU biases; a pose-only one
+      (eight columns, as the per-camera files are) yields ``None`` for them.
     * **Reference** -- space separated, timestamps in seconds. The quaternion columns are
       required here, because orientation is what lets the sensors be placed; a
       position-only file can still be drawn as a line via :func:`read_ground_truth`.
@@ -164,8 +200,10 @@ def read_trajectory(path: str | Path) -> Trajectory:
     """
     path = Path(path)
     comma = _is_comma_separated(path)
+    with_states = comma and _comma_column_count(path) >= _STATE_COLUMNS
     if comma:
-        raw = np.loadtxt(path, delimiter=",", skiprows=1, usecols=range(8),
+        columns = _STATE_COLUMNS if with_states else 8
+        raw = np.loadtxt(path, delimiter=",", skiprows=1, usecols=range(columns),
                          dtype=np.float64, ndmin=2)
     else:
         raw = _load_rows(path)
@@ -183,11 +221,13 @@ def read_trajectory(path: str | Path) -> Trajectory:
         if comma
         else np.rint(raw[:, 0] * NS_PER_S).astype(np.int64)  # seconds -> nanoseconds
     )
-    timestamps, positions, quaternions = _clean_poses(
-        path, timestamps, raw[:, 1:4], raw[:, 4:8]
-    )
+    keep = _pose_order(timestamps)
     return Trajectory(
-        timestamps_ns=timestamps, positions=positions, quaternions=quaternions
+        timestamps_ns=timestamps[keep],
+        positions=raw[keep, 1:4],
+        quaternions=_normalise_quaternions(path, raw[keep, 4:8]),
+        gyro_biases=raw[keep, 11:14] if with_states else None,
+        accel_biases=raw[keep, 14:17] if with_states else None,
     )
 
 

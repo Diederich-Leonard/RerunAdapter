@@ -9,7 +9,9 @@ lidar is shown in a lidar-fixed 3D view, and the IMU is split into two graphs.
 *With results* -- add ``--results`` and ``--config`` to overlay a SLAM run. A world-frame 3D
 view then shows the estimated trajectory, the submap meshes, every camera as a posed pinhole
 frustum, the lidar carried into world coordinates, and each posed frame (IMU, body, cameras,
-lidar) as a coordinate triad, which Rerun draws from the transforms themselves.
+lidar) as a coordinate triad, which Rerun draws from the transforms themselves. A full-state
+trajectory file also carries the estimated gyro and accelerometer biases, which get a row of
+graphs of their own beneath the measured IMU.
 
 Nothing about the sensor count is hardcoded: image streams are discovered from the directory
 layout, so two cameras or five work the same way. One IMU and one lidar are assumed.
@@ -361,37 +363,52 @@ def log_meshes(paths: list[Path]) -> tuple[int, int]:
     return len(paths), vertices
 
 
-def log_imu(imu: euroc.ImuData) -> None:
-    """Log both IMU triplets as scalar series, one columnar call per axis.
+def log_triplet(
+    entity: str, prefix: str, timestamps_ns: np.ndarray, values: np.ndarray
+) -> None:
+    """Log one xyz triplet as three scalar series, one columnar call per axis.
 
     ``send_columns`` ships a whole series in one call; the per-sample ``rr.log``
     equivalent would be hundreds of thousands of round trips on the larger datasets.
     """
+    times = [time_column(timestamps_ns)]
+    for axis_index, axis in enumerate("xyz"):
+        path = f"{entity}/{axis}"
+        rr.log(
+            path,
+            rr.SeriesLines(
+                names=[f"{prefix}_{axis}"],
+                colors=[AXIS_COLORS[axis_index]],
+                widths=[1.0],
+            ),
+            static=True,
+        )
+        rr.send_columns(
+            path,
+            indexes=times,
+            columns=rr.Scalars.columns(scalars=values[:, axis_index]),
+        )
+
+
+def log_imu(imu: euroc.ImuData) -> None:
+    """Log the measured acceleration and angular rate."""
     if len(imu) == 0:
         return
+    log_triplet(bp.IMU_ACCEL_PLOT, "a", imu.timestamps_ns, imu.accel)
+    log_triplet(bp.IMU_GYRO_PLOT, "w", imu.timestamps_ns, imu.gyro)
 
-    times = [time_column(imu.timestamps_ns)]
-    plots = (
-        (bp.IMU_ACCEL_PLOT, "a", imu.accel),
-        (bp.IMU_GYRO_PLOT, "w", imu.gyro),
-    )
-    for entity, prefix, values in plots:
-        for axis_index, axis in enumerate("xyz"):
-            path = f"{entity}/{axis}"
-            rr.log(
-                path,
-                rr.SeriesLines(
-                    names=[f"{prefix}_{axis}"],
-                    colors=[AXIS_COLORS[axis_index]],
-                    widths=[1.0],
-                ),
-                static=True,
-            )
-            rr.send_columns(
-                path,
-                indexes=times,
-                columns=rr.Scalars.columns(scalars=values[:, axis_index]),
-            )
+
+def log_biases(trajectory: results.Trajectory) -> None:
+    """Log the estimated IMU biases that came with the trajectory.
+
+    Sent on the trajectory's own timestamps, not the IMU's: these are estimator states
+    written once per optimised frame, so they are a much coarser series than the
+    measurements they correct.
+    """
+    if trajectory.gyro_biases is None or trajectory.accel_biases is None:
+        return
+    log_triplet(bp.GYRO_BIAS_PLOT, "b_g", trajectory.timestamps_ns, trajectory.gyro_biases)
+    log_triplet(bp.ACCEL_BIAS_PLOT, "b_a", trajectory.timestamps_ns, trajectory.accel_biases)
 
 
 def log_image(
@@ -763,10 +780,13 @@ def main() -> int:
     )
 
     # ---- connect to Rerun ----------------------------------------------------------
+    with_biases = trajectory is not None and trajectory.gyro_biases is not None
+
     layout = bp.build(
         list(images),
         with_lidar=lidar_reader is not None,
         with_imu=imu is not None and len(imu) > 0,
+        with_biases=with_biases,
         with_world=with_world,
         moving=frozenset(camera_poses),
     )
@@ -801,6 +821,13 @@ def main() -> int:
 
     if trajectory is not None:
         log_trajectory(trajectory)
+        if with_biases:
+            log_biases(trajectory)
+            print(
+                f"  biases   {len(trajectory):>7} states    "
+                f"final |b_g| = {np.linalg.norm(trajectory.gyro_biases[-1]):.4f} rad/s, "
+                f"|b_a| = {np.linalg.norm(trajectory.accel_biases[-1]):.4f} m/s^2"
+            )
 
     if ground_truth is not None:
         if trajectory is not None:
