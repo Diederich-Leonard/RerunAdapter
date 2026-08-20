@@ -140,8 +140,9 @@ def parse_args() -> argparse.Namespace:
         help="move one camera over time: FILE holds that camera's pose in the world frame, "
              "i.e. T_WC, as CSV rows (timestamp, position, xyzw quaternion; nanoseconds), "
              "already in the world frame, or a frame/pose JSON list (timestamp in seconds; "
-             "see results.read_pose_stream), rebased so its first pose matches the config's "
-             "T_SC for that camera, and STREAM names the image stream it belongs to, e.g. "
+             "see results.read_pose_stream), rebased so its first pose matches the camera's "
+             "world pose there -- the trajectory's T_WS at that timestamp composed with the "
+             "config's T_SC -- and STREAM names the image stream it belongs to, e.g. "
              "cam0=cam_pose_estimate.csv. Repeat for more than one camera. Needs --config",
     )
     overlay.add_argument(
@@ -523,13 +524,16 @@ def load_camera_poses(
     args: argparse.Namespace,
     streams: list[str],
     calibration: calib.Calibration | None,
+    trajectory: results.Trajectory | None = None,
 ) -> dict[str, results.PoseStream]:
     """Resolve ``--camera-pose STREAM=FILE`` into one pose stream per named camera.
 
     The names are checked against the cameras that actually exist in this run, so a typo or
     a stream excluded by ``--no-images`` is reported up front rather than silently moving
-    nothing. Each camera's nominal ``T_SC`` is passed through as the anchor a JSON pose file
-    gets rebased onto (see :func:`results.read_pose_stream`); a CSV file ignores it.
+    nothing. Each camera's nominal ``T_SC`` and the estimated trajectory are passed through
+    together: a JSON pose file is rebased onto the camera's *world* pose, ``T_WS`` at the
+    stream's first timestamp composed with ``T_SC`` (see :func:`results.camera_anchor`). A
+    CSV file is already ``T_WC`` and ignores both.
     """
     if not args.camera_poses:
         return {}
@@ -553,7 +557,7 @@ def load_camera_poses(
                 f"(cameras that can be moved: {known})"
             )
         anchor = calibration.cameras[placeable.index(name)].T_SC
-        loaded[name] = results.read_pose_stream(path, anchor=anchor)
+        loaded[name] = results.read_pose_stream(path, anchor=anchor, trajectory=trajectory)
     return loaded
 
 
@@ -611,7 +615,7 @@ def main() -> int:
     try:
         trajectory, trajectory_path, mesh_paths = load_results(args)
         calibration = calib.load(args.config) if args.config is not None else None
-        camera_poses = load_camera_poses(args, list(images), calibration)
+        camera_poses = load_camera_poses(args, list(images), calibration, trajectory)
         undistort_maps = (
             load_undistort_maps(calibration, list(images)) if args.undistort else {}
         )
@@ -731,6 +735,19 @@ def main() -> int:
         print(f"  traj     {trajectory_path.name}: {len(trajectory)} poses")
     for name, pose_stream in camera_poses.items():
         print(f"  campose  {pose_stream.name}: {len(pose_stream)} poses -> {name}")
+        # Only a rebased stream is anchored; a CSV is already T_WC and needs no trajectory.
+        if trajectory is None or dict(args.camera_poses)[name].suffix.lower() != ".json":
+            continue
+        first_ns = int(pose_stream.timestamps_ns[0])
+        if not (trajectory.timestamps_ns[0] <= first_ns <= trajectory.timestamps_ns[-1]):
+            print(
+                f"warning: the {name} pose stream starts at "
+                f"{first_ns / euroc.NS_PER_S:.3f} s, outside the trajectory "
+                f"({trajectory.timestamps_ns[0] / euroc.NS_PER_S:.3f} .. "
+                f"{trajectory.timestamps_ns[-1] / euroc.NS_PER_S:.3f} s), so it is anchored "
+                f"on the nearest end pose; the whole stream inherits that placement",
+                file=sys.stderr,
+            )
     if mesh_paths:
         print(f"           {len(mesh_paths)} mesh files")
     if lidar_reader is not None:

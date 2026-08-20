@@ -10,7 +10,7 @@ A result directory is expected to hold
 
 :func:`read_pose_stream` reads a moving camera's own pose file, in either of two formats --
 CSV rows already in the world frame, or a frame/pose JSON list rebased onto it (see
-:func:`_rebase_to_anchor`).
+:func:`camera_anchor` and :func:`_rebase_to_anchor`).
 """
 
 from __future__ import annotations
@@ -369,19 +369,57 @@ def _read_pose_rows_json(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
     return timestamps_ns, positions, quaternions
 
 
+def _rigid(position: np.ndarray, quaternion_xyzw: np.ndarray) -> np.ndarray:
+    """4x4 rigid transform from a translation and a unit **xyzw** quaternion."""
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = Rotation.from_quat(quaternion_xyzw).as_matrix()
+    T[:3, 3] = position
+    return T
+
+
+def camera_anchor(
+    T_SC: np.ndarray, trajectory: Trajectory | None, timestamp_ns: int
+) -> np.ndarray:
+    """The camera's world pose ``T_WC = T_WS(t) * T_SC`` at ``timestamp_ns``.
+
+    This is the pose a JSON stream is rebased onto, and composing it with the trajectory is
+    the whole point: ``T_WS`` is *not* the identity at the stream's first timestamp, even
+    though the estimate starts at the world *origin*. OKVIS levels the initial attitude
+    against gravity, which leaves a degree or two of roll and pitch in ``T_WS`` from the very
+    first row, and a camera stream usually starts later still, by which time the rig has
+    genuinely moved. Taking the bare ``T_SC`` as the anchor folds all of that into a constant
+    rotation of the entire stream, which grows into metres of position error at the far end
+    of a long path -- the stream keeps its shape but leaves the trajectory it belongs to.
+
+    ``T_SC`` itself is only nominal, too: a camera configured ``slam_use: estimate-extrinsics``
+    has its extrinsic re-estimated online, so the calibrated value the trajectory was written
+    against is not the one in the config. Nothing here can recover that, which is one more
+    reason to prefer a camera's own world-frame CSV when the estimator wrote one.
+
+    With no trajectory to compose against, ``T_SC`` is the anchor: the rig then stays at the
+    world origin, so the camera's world pose really is its static extrinsic.
+    """
+    T_SC = np.asarray(T_SC, dtype=np.float64)
+    if trajectory is None or len(trajectory) == 0:
+        return T_SC
+    position, quaternion = PoseInterpolator(trajectory).at(timestamp_ns)
+    return _rigid(position, quaternion) @ T_SC
+
+
 def _rebase_to_anchor(
     anchor: np.ndarray, positions: np.ndarray, quaternions: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Rigidly shift a pose sequence so its first pose becomes ``anchor`` (a 4x4 ``T_SC``).
+    """Rigidly shift a pose sequence so its first pose becomes ``anchor`` (a 4x4 ``T_WC``).
 
     A JSON pose stream is expressed in its own producer's arbitrary frame -- there is no
-    reason it shares OKVIS's world frame, and in practice it does not. But the estimated IMU
-    trajectory always starts at the world origin with identity rotation (``T_WS(0) = I``),
-    so the camera's true world pose at that same first timestamp is exactly the config's
-    static ``T_SC``, with no need for the world-frame trajectory itself to compute it. Rigidly
-    transforming the whole stream so it starts there -- rather than wherever its own
-    producer's frame happened to put it -- turns it into ``T_WC`` while preserving all of its
-    internal (relative) motion untouched.
+    reason it shares OKVIS's world frame, and in practice it does not. Rigidly transforming
+    the whole stream so it starts at the camera's known world pose -- rather than wherever
+    its own producer's frame happened to put it -- turns it into ``T_WC`` while preserving
+    all of its internal (relative) motion untouched.
+
+    Which world pose that is comes from :func:`camera_anchor`. It is a single constant
+    correction applied to every pose, so an anchor that is off by a degree tilts the whole
+    stream by a degree.
     """
     anchor_rotation = Rotation.from_matrix(anchor[:3, :3])
     anchor_translation = anchor[:3, 3]
@@ -395,14 +433,22 @@ def _rebase_to_anchor(
     return new_positions, new_quaternions
 
 
-def read_pose_stream(path: str | Path, *, anchor: np.ndarray | None = None) -> PoseStream:
+def read_pose_stream(
+    path: str | Path,
+    *,
+    anchor: np.ndarray | None = None,
+    trajectory: Trajectory | None = None,
+) -> PoseStream:
     """Read a moving camera's pose file, in either of two formats.
 
     * **CSV** -- ``timestamp tx ty tz qx qy qz qw`` rows, comma- or whitespace-separated,
-      timestamps already nanoseconds on the dataset clock, poses already ``T_WC``.
+      timestamps already nanoseconds on the dataset clock, poses already ``T_WC``. Neither
+      ``anchor`` nor ``trajectory`` is consulted.
     * **JSON** -- a frame/pose list (``.json`` extension), timestamps in seconds (converted
-      to nanoseconds on read), poses rebased onto ``anchor`` -- see :func:`_rebase_to_anchor`
-      -- which for this format is required and should be the camera's config ``T_SC``.
+      to nanoseconds on read), poses rebased onto the camera's world pose at the stream's own
+      first timestamp. ``anchor`` is the camera's config ``T_SC`` and is required for this
+      format; ``trajectory`` is the estimate that carries it into the world frame. See
+      :func:`camera_anchor` and :func:`_rebase_to_anchor`.
 
     Either way a pose stream is only meaningful against the measurements it is being
     composed with, so its timestamps have to end up on the same dataset clock as those.
@@ -424,7 +470,11 @@ def read_pose_stream(path: str | Path, *, anchor: np.ndarray | None = None) -> P
                 f"{path}: a JSON pose file needs the camera's static T_SC (from --config) "
                 f"to rebase its own frame onto the world frame"
             )
-        positions, quaternions = _rebase_to_anchor(anchor, positions, quaternions)
+        # Anchored at the stream's own first timestamp, which is the pose
+        # _rebase_to_anchor pins -- not the trajectory's start, which is generally earlier.
+        positions, quaternions = _rebase_to_anchor(
+            camera_anchor(anchor, trajectory, int(timestamps[0])), positions, quaternions
+        )
 
     return PoseStream(
         name=path.stem,
